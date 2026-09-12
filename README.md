@@ -2,452 +2,170 @@
 
 **English** | [한국어](README.ko.md)
 
-> Detect **alive-but-stalled vLLM instances** and automatically recover them.
+**Detect stalled inference in a running vLLM instance and automatically restart its container.**
 
-**vLLM Self-Healer** is a lightweight external watchdog for vLLM deployments running with Docker.
-
-It detects a failure mode that ordinary container health monitoring can miss:
+vLLM Self-Healer is a lightweight external watchdog. It combines /health checks with real synthetic generation requests to detect cases where the HTTP server responds but inference no longer completes.
 
 ```text
-Container       running
-vLLM process    alive
-GET /health     200 OK
-Inference       stalled / timeout
+/health: 200 OK + inference: timeout
+                 ↓
+       consecutive failure threshold
+                 ↓
+        restart policy evaluation
+                 ↓
+     Docker restart → recovery probes
 ```
 
-Instead of relying only on process or HTTP liveness, vLLM Self-Healer verifies **actual inference forward progress** using a small synthetic generation request.
-
-When repeated failures are detected, it can:
-
-* restart the affected vLLM container
-* verify that inference really recovered
-* prevent infinite restart loops
-* persist restart history across watchdog restarts
-* optionally send webhook alerts
-
-The watchdog itself does not require a GPU.
-
----
-
-## Why?
-
-Docker restart policies are useful when a process exits.
-
-They cannot recover a service that is still alive but no longer making useful progress.
-
-The same problem can occur with vLLM:
-
-```text
-HTTP API
-   ↓
-EngineCore
-   ↓
-Scheduler
-   ↓
-ModelRunner
-   ↓
-CUDA / NCCL
-   ↓
-GPU
-```
-
-The HTTP server may remain responsive even when something deeper in this path has stalled.
-
-This type of failure has also been reported upstream in vLLM.
-
-Examples include:
-
-| Upstream case               | Symptom                                                                                                  |
-| --------------------------- | -------------------------------------------------------------------------------------------------------- |
-| vllm-project/vllm #52319    | Generation stops completely while `/health` and `/metrics` continue returning HTTP 200                   |
-| vllm-project/vllm #52247    | EngineCore remains alive while blocked on a GPU synchronization event; `/health` continues returning 200 |
-| vllm-project/vllm #42897    | Token generation stops under sustained traffic while the HTTP layer remains responsive                   |
-| vllm-project/vllm #36960    | Proposal for GPU-aware readiness because process liveness alone cannot prove inference availability      |
-| vllm-project/vllm PR #36451 | Adds EngineCore forward-progress detection specifically for an alive-but-hung state                      |
-
-For example, upstream issue #52247 describes a production incident where a GPU kernel never terminated, EngineCore remained alive, `/health` continued returning 200, and affected instances served no inference for hours.
-
-That is the gap this project is designed to cover externally.
-
-Instead of asking only:
-
-```text
-Is the process alive?
-```
-
-vLLM Self-Healer also asks:
-
-```text
-Can this instance actually complete an inference request?
-```
-
----
-
-## How it works
-
-Each monitoring cycle runs two independent probes.
-
-### 1. Health probe
-
-```http
-GET /health
-```
-
-Checks basic vLLM engine health.
-
-### 2. Synthetic inference probe
-
-```http
-POST /v1/chat/completions
-```
-
-with a minimal request similar to:
-
-```json
-{
-  "model": "your-model",
-  "messages": [
-    {
-      "role": "user",
-      "content": "ping"
-    }
-  ],
-  "max_tokens": 1,
-  "temperature": 0
-}
-```
-
-This verifies significantly more than HTTP availability.
-
-A successful inference probe exercises the path through:
-
-```text
-HTTP request
-    ↓
-request processing
-    ↓
-scheduler
-    ↓
-model execution
-    ↓
-GPU
-    ↓
-decode
-    ↓
-completed response
-```
-
-The health and inference probes maintain **independent failure counters**.
-
-A successful `/health` response therefore does not clear an inference failure.
-
-That distinction is critical for detecting an alive-but-stalled instance.
-
----
-
-## State machine
-
-```text
-                  ┌─────────────┐
-                  │   HEALTHY   │
-                  └──────┬──────┘
-                         │
-                    probe failure
-                         │
-                         ▼
-                  ┌─────────────┐
-                  │   SUSPECT   │
-                  └──────┬──────┘
-                         │
-              consecutive failures
-                         │
-                         ▼
-                 ┌──────────────┐
-                 │  RESTARTING  │
-                 └──────┬───────┘
-                        │
-                  Docker restart
-                        │
-                        ▼
-                 ┌──────────────┐
-                 │  RECOVERING  │
-                 └──────┬───────┘
-                        │
-               health + inference
-                    ┌───┴───┐
-                    │       │
-                  success   timeout
-                    │       │
-                    ▼       ▼
-                 HEALTHY   retry policy
-                              │
-                        restart limit
-                              │
-                              ▼
-                           FAILED
-```
-
-### HEALTHY
-
-Both probes are succeeding.
-
-### SUSPECT
-
-At least one probe is failing, but the configured failure threshold has not yet been reached.
-
-### RESTARTING
-
-The watchdog records the restart attempt and asks Docker to restart the target vLLM container.
-
-### RECOVERING
-
-After the configured startup grace period, both probes are executed repeatedly.
-
-Recovery succeeds only when:
-
-```text
-health probe    = success
-inference probe = success
-```
-
-in the same recovery iteration.
-
-### FAILED
-
-Automatic recovery is stopped after the restart budget is exhausted or when persistent state cannot be safely maintained.
-
-`FAILED` is persisted intentionally.
-
-Restarting the watchdog itself does not silently reset the recovery budget.
-
----
-
-## Alive-but-stalled detection
-
-One particularly important state is:
-
-```text
-health     = success
-inference  = failure
-```
-
-The watchdog reports this as:
-
-```text
-ALIVE_BUT_STALLED
-```
-
-Example:
-
-```text
-03:21:01  health probe       success
-03:21:05  inference probe    timeout
-
-03:21:31  health probe       success
-03:21:35  inference probe    timeout
-
-03:22:01  health probe       success
-03:22:05  inference probe    timeout
-
-failure threshold reached
-
-03:22:05  ALIVE_BUT_STALLED
-03:22:05  RESTART_TRIGGERED
-```
-
-After the restart:
-
-```text
-RECOVERING
-
-health     success
-inference  success
-
-RECOVERY_SUCCESS
-HEALTHY
-```
-
----
-
-## Restart-loop protection
-
-Blind restart loops can make an incident worse.
-
-vLLM Self-Healer therefore uses bounded recovery.
-
-It tracks restart timestamps and limits how many restart attempts may occur within a configured window.
-
-For example:
-
-```text
-MAX_RESTARTS=3
-RESTART_WINDOW=600
-```
-
-allows at most three restart attempts within ten minutes.
-
-The final permitted restart still receives a normal recovery check.
-
-If recovery fails and another restart would be required, the watchdog enters:
-
-```text
-FAILED
-```
-
-instead of restarting forever.
-
-A separate restart cooldown prevents repeated restart calls in rapid succession.
-
----
-
-## Persistent state
-
-Restart history is stored in:
-
-```text
-/data/watchdog_state.json
-```
-
-by default.
-
-State is persisted using atomic file replacement and `fsync`.
-
-Restart attempts are recorded **before** the Docker restart call.
-
-This matters because a Docker API timeout does not necessarily mean that the server-side restart failed.
-
-After such an uncertain result, the watchdog verifies recovery before attempting another restart.
-
-State corruption or persistence failures prevent automatic restarts rather than silently discarding the recovery history.
-
-To intentionally reset a latched `FAILED` state:
-
-1. stop the watchdog
-2. resolve the underlying problem
-3. back up the state file if needed
-4. delete only the watchdog state JSON
-5. start the watchdog again
-
-This resets the restart budget.
-
----
+A single failure does not trigger a restart. Recovery attempts are bounded, and each restart is followed by actual inference verification. The watchdog itself does not need a GPU.
 
 ## Features
 
-* Detects **alive-but-stalled vLLM instances**
-* `/health` probing
-* Real synthetic inference probing
-* Independent health/inference failure counters
-* Consecutive-failure thresholds
-* Automatic Docker container restart
-* Startup grace period
-* Post-restart recovery verification
-* Restart cooldown
-* Rolling restart budget
-* Restart-loop protection
-* Persistent recovery state
-* Optional webhook alerts
-* Structured JSON logs
-* Graceful SIGTERM / SIGINT handling
-* Non-root container
-* Read-only-container friendly
-* `linux/amd64`
-* `linux/arm64`
-* No GPU dependency for the watchdog itself
+- **Real inference probes:** exercise the generation path with a small request.
+- **Automatic recovery:** restart the target Docker container after repeated failures.
+- **Recovery verification:** wait for model loading, then require both probes to succeed.
+- **Restart safeguards:** cooldown, rolling limits, and a cap on attempts without recovery.
+- **Persistent state:** retain restart history and FAILED across watchdog restarts.
+- **Operations:** JSON logs, optional webhooks, and amd64/arm64 images.
 
----
+## Quick start
 
-# Quick Start
+Add the watchdog to the Compose project containing your existing vLLM service. The example assumes Linux and an accessible host Docker socket.
 
-## Pull the image
+Pull the image:
 
 ```bash
 docker pull ghcr.io/pyg410/vllm-self-healer:latest
 ```
 
-For production deployments, prefer a released version:
+Find the Docker socket group ID:
 
 ```bash
-docker pull ghcr.io/pyg410/vllm-self-healer:v0.1.0
+stat -c '%g' /var/run/docker.sock
 ```
 
-or pin the image digest for fully reproducible deployment.
+Add the served model name and socket group to your project's .env:
 
----
+```dotenv
+VLLM_MODEL=your-served-model
+DOCKER_SOCKET_GID=998
+VLLM_API_KEY=
+```
 
-## Docker Compose
+Replace 998 with the actual group ID. Set VLLM_API_KEY if the API requires authentication. The model must support chat completions and have a chat template.
 
-Add the watchdog next to your existing vLLM service.
+Merge this service into your existing services mapping and add watchdog-data to the top-level volumes mapping:
 
 ```yaml
 services:
-
-  vllm:
-    # your existing vLLM configuration
-
   vllm-self-healer:
-    image: ghcr.io/pyg410/vllm-self-healer:v0.1.0
+    image: ghcr.io/pyg410/vllm-self-healer:latest
     restart: unless-stopped
-
     environment:
       VLLM_BASE_URL: http://vllm:8000
       VLLM_CONTAINER_NAME: vllm
-      VLLM_MODEL: ${VLLM_MODEL}
-
+      VLLM_MODEL: ${VLLM_MODEL:?Set the served model name}
       VLLM_API_KEY: ${VLLM_API_KEY:-}
-
       STATE_FILE: /data/watchdog_state.json
-
     group_add:
-      - "${DOCKER_SOCKET_GID}"
-
+      - "${DOCKER_SOCKET_GID:?Set the Docker socket group ID}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - watchdog-data:/data
-
     read_only: true
-
     security_opt:
       - no-new-privileges:true
-
     cap_drop:
       - ALL
-
     stop_grace_period: 90s
 
 volumes:
   watchdog-data:
 ```
 
-Get the Docker socket group ID:
-
-```bash
-stat -c '%g' /var/run/docker.sock
-```
-
-Then start:
+Ensure vllm resolves to the API service on the shared Docker network. Set VLLM_CONTAINER_NAME to the actual container name or ID to restart; Compose service names and generated container names can differ.
 
 ```bash
 docker compose up -d vllm-self-healer
-```
-
-View logs:
-
-```bash
 docker compose logs -f vllm-self-healer
 ```
 
-Both containers must be able to communicate over the same Docker network.
+On a fresh watchdog startup and after a vLLM restart, the default startup grace is 300 seconds. Both probes must then succeed before normal monitoring begins. Previously saved recovery deadlines and FAILED state are preserved.
 
-`VLLM_CONTAINER_NAME` must identify the actual container the watchdog is allowed to restart.
+> Docker socket access grants extensive control over the host Docker daemon. Give it only to trusted code and images.
 
----
+For production, select a published version or pin an image digest. A previously published build is also available as ghcr.io/pyg410/vllm-self-healer:sha-440c4334. The v0.1.0 tag below is a release example, not a claim that this version has been published.
 
-# Configuration
+## Failure detection
 
-All settings are configured through environment variables.
+Each normal monitoring cycle runs two separate checks:
 
-Durations are expressed in seconds.
+| Probe | Success condition | Default deadline |
+|---|---|---|
+| GET /health | HTTP 200 | 5 seconds |
+| POST /v1/chat/completions | HTTP 200 and valid terminal completion JSON | 15 seconds |
+
+The inference request uses the configured model, prompt ping, max_tokens=1, temperature=0, and stream=false by default. Prompt and token budget are configurable.
+
+| Health | Inference | Interpretation |
+|---|---|---|
+| Success | Success | Healthy |
+| Success | Failure | Suspected inference-path problem |
+| Failure | Success | Possible health endpoint problem |
+| Failure | Failure | Possible service or connectivity problem |
+
+**Every health-success/inference-failure result is logged with reason ALIVE_BUT_STALLED, including the first failure.** This is a diagnostic reason, not a separate watchdog state or proof of a GPU hang. During normal monitoring the state becomes SUSPECT.
+
+The probes have independent consecutive failure counters. Success resets only that probe's counter. By default, when either counter reaches three, the watchdog evaluates the restart policy. Restart occurs only if the budget and cooldown permit it.
+
+Completion validation requires object=chat.completion, nonempty choices, an integer choice index, an assistant message with a content field, and finish_reason=stop or length. Empty/null content is allowed for immediate EOS or a small reasoning-model budget. This validates completion structure, not answer quality. Malformed JSON and HTTP/connection/timeout errors count as failures.
+
+## Recovery policy and states
+
+```text
+Startup → RECOVERING → both probes succeed → HEALTHY
+HEALTHY → probe failure → SUSPECT
+SUSPECT → threshold + restart policy permit → RESTARTING
+RESTARTING → RECOVERING → success → HEALTHY
+RECOVERING → timeout → retry policy → restart or FAILED
+```
+
+| State | Meaning |
+|---|---|
+| HEALTHY | Both probes succeeded |
+| SUSPECT | Probe failures; may also be waiting for cooldown after reaching the threshold |
+| RESTARTING | Attempt recorded; Docker restart requested |
+| RECOVERING | Waiting for startup grace or verifying readiness |
+| FAILED | Automatic probes/restarts stopped; operator action required |
+
+After a restart, the watchdog waits STARTUP_GRACE_PERIOD (300 seconds), then checks recovery at RECOVERY_CHECK_INTERVAL (10 seconds). RECOVERY_TIMEOUT (600 seconds) begins **after grace ends**. Recovery requires both probes to succeed in the same iteration.
+
+Three safeguards apply:
+
+| Safeguard | Default |
+|---|---|
+| Minimum interval between restart attempt start times | 300 seconds |
+| Maximum attempts within the last 600 seconds | 3 |
+| Maximum consecutive attempts without verified recovery | 3 |
+
+The last allowed attempt still gets recovery verification. If another restart is needed after the budget is exhausted, the watchdog latches into FAILED. Successful recovery clears the unrecovered attempt count but preserves recent restart timestamps.
+
+Docker daemon failures and ambiguous API timeouts consume an attempt too. Because a timeout may still mean Docker acted server-side, the watchdog checks recovery before trying again.
+
+The loop is synchronous: each normal iteration takes health request time + inference request time + CHECK_INTERVAL. Requests do not overlap. Recovery probe deadlines are capped by the remaining recovery time.
+
+## Recovery scope and limitations
+
+Recovery means restarting one Docker container. The watchdog does not diagnose or repair CUDA, NCCL, driver, or hardware bugs.
+
+- Restarting interrupts in-flight requests.
+- Network outages, incorrect credentials/model names, and overload can all cause probe failures. Tune deadlines and thresholds to real service latency.
+- A short completion cannot establish the health of every replica, long generation, or all GPU functions.
+- One watchdog targets one container. Separate watchdogs with independent state volumes are not coordinated.
+- GPU reset, host reboot, traffic draining, and Prometheus-based decisions are not implemented.
+
+## Configuration
+
+All settings use environment variables. Durations are in seconds. Positive values are required except startup grace, cooldown, and Docker stop timeout, which may be zero. DOCKER_API_TIMEOUT must exceed DOCKER_STOP_TIMEOUT.
 
 | Variable                  |                     Default | Description                                 |
 | ------------------------- | --------------------------: | ------------------------------------------- |
@@ -474,321 +192,168 @@ Durations are expressed in seconds.
 | `STATE_FILE`              | `/data/watchdog_state.json` | Persistent watchdog state                   |
 | `LOG_LEVEL`               |                      `INFO` | Logging level                               |
 
-The example `.env.example` contains the available configuration variables.
+RECOVERY_TIMEOUT excludes startup grace. MAX_RESTARTS applies to both the rolling window and consecutive attempts without recovery. See [.env.example](.env.example) for the complete environment example, including Compose-only image and socket group settings.
 
----
+## Logs and alerts
 
-# Probe behavior
+Logs are JSON on stdout. Successful probes use DEBUG; failures use WARNING. State transitions and recovery events use INFO or higher. Set LOG_LEVEL=DEBUG to see successful checks.
 
-## Health validation
+Example probe log, formatted for readability:
 
-The health probe requires a successful `/health` request.
-
-## Inference validation
-
-A generation request is considered successful only when the response has a valid terminal OpenAI-compatible chat completion structure.
-
-The watchdog validates fields such as:
-
-* HTTP status
-* JSON object shape
-* completion object type
-* `choices`
-* choice index
-* assistant message
-* terminal `finish_reason`
-
-An empty or null assistant content may still be considered valid when the request completed normally, which accommodates immediate EOS and some reasoning-model behaviors with a very small generation budget.
-
----
-
-# Timing behavior
-
-The watchdog runs as a **single synchronous control loop**.
-
-Probe executions do not overlap.
-
-Therefore:
-
-```text
-iteration duration
-≈ health probe
-+ inference probe
-+ CHECK_INTERVAL
+```json
+{
+  "timestamp": "2026-09-13T03:21:05+00:00",
+  "level": "WARNING",
+  "event": "probe result",
+  "state": "healthy",
+  "health": true,
+  "inference": false,
+  "health_failure_count": 0,
+  "inference_failure_count": 1,
+  "reason": "ALIVE_BUT_STALLED"
+}
 ```
 
-in the worst case.
+The state field reflects the state at probe time; the subsequent state transition records healthy → suspect. Restart logs include both failure counters, reason, restart count, and the last successful inference timestamp.
 
-During recovery, individual I/O deadlines are additionally bounded by the remaining recovery deadline.
+Set ALERT_WEBHOOK_URL to enable best-effort HTTP notifications. Events are RESTART_TRIGGERED, RECOVERY_SUCCESS, RECOVERY_FAILED, and MAX_RESTART_EXCEEDED. Initial readiness also emits RECOVERY_SUCCESS.
 
-This design deliberately favors predictable recovery behavior over high-frequency concurrent probing.
+Example webhook payload:
 
----
-
-# Logging
-
-Logs are emitted as structured JSON to stdout.
-
-Typical events include:
-
-```text
-HEALTHY
-SUSPECT
-ALIVE_BUT_STALLED
-RESTART_TRIGGERED
-RECOVERING
-RECOVERY_SUCCESS
-RECOVERY_FAILED
-MAX_RESTART_EXCEEDED
-FAILED
+```json
+{
+  "service": "vllm-watchdog",
+  "container": "vllm",
+  "event": "RESTART_TRIGGERED",
+  "reason": "ALIVE_BUT_STALLED",
+  "restart_count": 1,
+  "timestamp": "2026-09-13T03:22:15+00:00"
+}
 ```
 
-Restart events include diagnostic fields such as:
+Webhook failures are logged and do not terminate the loop, though delivery may delay it by up to ALERT_TIMEOUT. There is no retry queue. API keys, Authorization headers, prompts, response bodies, raw exception text, and webhook URLs are excluded from logs.
 
-* reason
-* health failure count
-* inference failure count
-* restart count
-* last successful inference timestamp
+## Persistent state and FAILED recovery
 
-Sensitive data is intentionally excluded.
+State is saved to /data/watchdog_state.json using atomic replacement and fsync. Restart attempts are persisted **before** the Docker API call. The file also retains recovery timing, the unrecovered attempt count, and last successful inference time.
 
-The watchdog does not log:
+A file lock prevents concurrent watchdogs from using the same state path. Corrupt or unwritable state disables automatic restarts; corrupt files are preserved. FAILED remains latched after restarting the watchdog. Persistence errors can prevent FAILED itself from being saved.
 
-* API keys
-* Authorization headers
-* inference prompts
-* response bodies
-* webhook URLs
+To reset it intentionally:
 
----
+1. Stop the watchdog.
+2. Investigate the logs and resolve the underlying problem.
+3. Back up the state file if needed.
+4. Delete only the watchdog state JSON, not the entire volume.
+5. Start the watchdog again.
 
-# Alerts
+This resets the restart budget. Merely restarting the watchdog does not.
 
-An optional webhook can receive important recovery events.
+SIGTERM/SIGINT interrupt waits and prevent new restart attempts. In-flight I/O finishes within its deadline, then state is saved and logging flushed. Set stop_grace_period above the longest Docker/probe deadline plus alert time; the example uses 90 seconds.
 
-Supported events include:
+## Deployment and releases
 
-```text
-RESTART_TRIGGERED
-RECOVERY_SUCCESS
-RECOVERY_FAILED
-MAX_RESTART_EXCEEDED
-```
+### Local build
 
-The alert path is best-effort.
-
-A failed webhook delivery does not stop the monitoring loop.
-
----
-
-# Graceful shutdown
-
-`SIGTERM` and `SIGINT` interrupt waiting periods and prevent new restart attempts.
-
-In-flight I/O is allowed to finish within its configured deadline before state persistence and shutdown complete.
-
-When using Docker Compose, configure `stop_grace_period` above the longest relevant probe/alert timeout.
-
----
-
-# Docker socket security
-
-> **Important:** access to `/var/run/docker.sock` effectively grants host-level Docker administration capability.
-
-A process with Docker socket access may be able to:
-
-* create privileged containers
-* mount host filesystems
-* inspect other containers
-* control other Docker workloads
-
-Running this watchdog as a non-root user, dropping Linux capabilities, and using a read-only filesystem are useful defense-in-depth measures, but **they do not remove the authority provided by the Docker socket itself**.
-
-Only run trusted images and code with direct Docker socket access.
-
-For stronger isolation, place an authorization proxy between the watchdog and Docker and allow only the minimum operations required for the target container.
-
-Do **not** solve socket permission problems by making the Docker socket world-writable.
-
----
-
-# Tests
-
-Tests do not require Docker or a GPU.
+The prebuilt-image quick start does not require a clone. For source-based deployment, use [docker-compose.example.yml](docker-compose.example.yml):
 
 ```bash
-python3 -m venv .venv
-
-.venv/bin/pip install -r requirements.txt
-
-.venv/bin/python -m unittest discover -v
+git clone https://github.com/pyg410/vllm-self-healer.git
+cd vllm-self-healer
+cp .env.example .env
+# Configure .env before starting.
+docker compose -f docker-compose.example.yml up -d --build
 ```
 
-Local execution:
+The example vLLM service needs a compatible GPU environment. For a standalone watchdog image build, run docker build -t vllm-self-healer:test . from the repository root.
 
-```bash
-VLLM_MODEL=my-model \
-VLLM_BASE_URL=http://localhost:8000 \
-STATE_FILE=/tmp/watchdog-state.json \
-.venv/bin/python -m watchdog.main
-```
+The watchdog runs as UID/GID 10001. Named volumes use /data ownership; bind mounts need write permission for UID 10001. Adjust socket paths and group IDs for rootless Docker.
 
-The test suite covers scenarios including:
+### GHCR and version releases
 
-* healthy operation
-* single probe failure
-* consecutive failures
-* inference-only failure
-* health-only failure
-* alive-but-stalled detection
-* recovery success
-* recovery timeout
-* restart limits
-* cooldown
-* state persistence
-* corrupted state
-* Docker daemon errors
-* webhook failure
-* graceful shutdown
+[GitHub Actions](.github/workflows/docker-publish.yml) builds linux/amd64 and linux/arm64 with Buildx/QEMU and layer caching. It runs amd64 container tests and startup/shutdown checks before publishing, then verifies pulls and runtime imports for both architectures.
 
----
+| Push | Image tags |
+|---|---|
+| master | latest and sha-xxxxxxxx |
+| v* tag | Exact Git tag and sha-xxxxxxxx |
 
-# Container images
+SHA tags use eight characters. Version-tag pushes do not update latest. Publishing uses the built-in GITHUB_TOKEN with contents: read and packages: write; no separate PAT is needed by the workflow.
 
-Prebuilt images are published to:
-
-```text
-ghcr.io/pyg410/vllm-self-healer
-```
-
-Supported architectures:
-
-```text
-linux/amd64
-linux/arm64
-```
-
-The watchdog itself performs no GPU computation.
-
-Your vLLM deployment still requires its own compatible GPU environment.
-
----
-
-# Releases
-
-The GitHub Actions publishing workflow produces images for:
-
-```text
-master push
-    ├─ latest
-    └─ sha-xxxxxxxx
-
-v* tag
-    ├─ exact version tag
-    └─ sha-xxxxxxxx
-```
-
-Example release:
+The following v0.1.0 commands are examples. Create a new release only when intended, on a commit containing the workflow, and wait for Actions to succeed before pulling it:
 
 ```bash
 git tag -a v0.1.0 -m "Release v0.1.0"
-
 git push origin v0.1.0
 ```
-
-Then:
 
 ```bash
 docker pull ghcr.io/pyg410/vllm-self-healer:v0.1.0
 ```
 
-Production deployments should prefer version tags or immutable image digests over `latest`.
+Existing Git tags are not built retroactively. Do not reuse release versions. Base images/dependencies may change between builds; pin a digest for an immutable artifact.
 
----
+For anonymous pulls, the GHCR package must be Public. A public repository does not automatically make its package public. Package owners can change this in GitHub Packages settings. Private packages require credentials with package read access and docker login ghcr.io. Manual authentication is separate from the workflow's GITHUB_TOKEN.
 
-# Offline / closed-network deployment
+### Offline deployment
 
-Pull the image from a connected machine:
-
-```bash
-docker pull --platform linux/amd64 \
-  ghcr.io/pyg410/vllm-self-healer:v0.1.0
-```
-
-Export it:
+On a connected machine, pull a published build for the destination architecture and export it:
 
 ```bash
-docker save \
-  -o vllm-self-healer-v0.1.0.tar \
-  ghcr.io/pyg410/vllm-self-healer:v0.1.0
+docker pull --platform linux/amd64 ghcr.io/pyg410/vllm-self-healer:sha-440c4334
+docker save -o vllm-self-healer-sha-440c4334.tar ghcr.io/pyg410/vllm-self-healer:sha-440c4334
 ```
 
-Transfer the archive through your approved process.
-
-On the offline host:
+Use linux/arm64 instead when appropriate. Transfer the archive through your approved process, then load it on the offline host:
 
 ```bash
-docker load -i vllm-self-healer-v0.1.0.tar
+docker load -i vllm-self-healer-sha-440c4334.tar
 ```
 
-The loaded image can also be retagged and pushed to an internal Nexus, Harbor, or other OCI-compatible registry.
+Retag and push to an internal Nexus/Harbor registry if needed, and update Compose's image reference. Provision the vLLM image and model weights separately; this archive contains only the watchdog.
 
----
+## Docker socket security
 
-# Known limitations
+**Access to /var/run/docker.sock effectively grants host-level Docker administration.** It may allow privileged containers, host filesystem mounts, and control of other workloads.
 
-vLLM Self-Healer intentionally has a narrow responsibility:
+Non-root execution, dropped capabilities, and a read-only filesystem provide additional protection but do not remove the socket's authority. Use trusted images only. For stronger isolation, restrict target containers and Docker operations through an authorization layer. Never make the socket world-writable to fix permissions.
 
-> Detect loss of inference forward progress and perform bounded Docker-level recovery.
+## Background and upstream reports
 
-It does not attempt to identify or repair the underlying vLLM, CUDA, NCCL, driver, or hardware bug.
+**A running process is necessary for serving inference, but it is not sufficient.** Docker restart policies handle process exits; an HTTP health response alone does not demonstrate generation progress.
 
-Important limitations:
+Related upstream reports and work include:
 
-* One watchdog targets one vLLM container.
-* Restarting interrupts in-flight requests.
-* Network outages can look similar to an inference stall.
-* Incorrect authentication or model configuration can trigger probe failures.
-* Extreme overload can cause inference probes to exceed their timeout even when the engine is technically healthy.
-* Timeouts and thresholds must therefore be tuned for the deployment's real latency distribution.
-* A container restart cannot recover every GPU or driver failure.
-* Some failures may require GPU reset, node isolation, driver recovery, or host reboot.
-* Docker socket access has significant security implications.
-* Multiple watchdog instances with independent state volumes are not coordinated.
+| Reference | Topic |
+|---|---|
+| [Issue #52319](https://github.com/vllm-project/vllm/issues/52319) | Reported generation stall while health/metrics remain responsive |
+| [Issue #52247](https://github.com/vllm-project/vllm/issues/52247) | EngineCore blocked on GPU synchronization |
+| [Issue #42897](https://github.com/vllm-project/vllm/issues/42897) | EngineCore hang under sustained traffic |
+| [Issue #36960](https://github.com/vllm-project/vllm/issues/36960) | Proposal for GPU-aware readiness checks |
+| [PR #36451](https://github.com/vllm-project/vllm/pull/36451) | Work on detecting alive-but-hung EngineCore |
 
-The restart budget exists specifically so that an unrecoverable host-level failure does not turn into an endless container restart loop.
+These are background references, not a claim that this watchdog reproduces or fixes every reported failure. It complements vLLM health mechanisms with an external generation check.
 
----
+## Development and tests
 
-# Design philosophy
+Python 3.12 on Linux/macOS is recommended. Tests need neither Docker nor a GPU; HTTP tests open a loopback listener.
 
-This project deliberately separates:
-
-```text
-liveness
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m unittest discover -v
 ```
 
-from:
+Run locally:
 
-```text
-forward progress
+```bash
+VLLM_MODEL=my-model VLLM_BASE_URL=http://localhost:8000 STATE_FILE=/tmp/watchdog-state.json .venv/bin/python -m watchdog.main
 ```
 
-A running process is necessary for serving inference.
+Tests cover probe validation, consecutive failures, recovery, budgets, cooldown, persistence/corruption, Docker errors, webhooks, and signal handling.
 
-It is not sufficient.
+The synchronous client uses POSIX SIGALRM deadlines and must run on the main thread. Windows and embedding alongside another SIGALRM user are unsupported. Recovery uses monotonic time during execution; persisted timestamps use wall time, so major clock changes can affect restored timing. OS-level disk hangs are outside the HTTP/Docker deadline mechanism.
 
-The watchdog therefore treats a successful generation request as the strongest external signal that the serving path is still functional.
+## License
 
-This is not intended to replace vLLM's own health mechanisms.
-
-It is an additional operational safety layer for deployments where recovering from an alive-but-stalled inference server matters.
-
----
-
-# License
-
-Apache License 2.0.
-
-See `LICENSE` for details.
+Apache License 2.0. See [LICENSE](LICENSE).
