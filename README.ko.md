@@ -75,6 +75,128 @@ FAILED 해제: watchdog을 정지하고 원인을 해결한 뒤 상태 JSON을 �
 
 Compose 전용 변수: VLLM_IMAGE(예시는 latest, 운영에서는 검증한 버전/digest로 고정), DOCKER_SOCKET_GID(호스트 socket의 숫자 group ID). .env.example에 전체 설정이 있습니다.
 
+## Docker 이미지 설치
+
+빌드된 watchdog 이미지는 **ghcr.io/pyg410/vllm-self-healer**에 게시됩니다. 저장소를 clone하거나 직접 빌드하지 않고 받을 수 있습니다. linux/amd64와 linux/arm64를 빌드하며 watchdog 자체는 GPU 연산을 하지 않습니다. 별도로 운영하는 vLLM에는 호환되는 GPU 환경이 필요합니다.
+
+기본 브랜치의 최신 빌드:
+
+```sh
+docker pull ghcr.io/pyg410/vllm-self-healer:latest
+```
+
+운영환경에서는 릴리스 버전 사용을 권장합니다.
+
+```sh
+docker pull ghcr.io/pyg410/vllm-self-healer:v0.1.0
+```
+
+v0.1.0 명령어는 릴리스 예시입니다. 해당 Git 태그를 push하고 게시 workflow가 성공한 뒤에 사용할 수 있습니다. Workflow를 추가해도 기존 v0.0.1 등의 태그를 소급하여 빌드하지 않습니다.
+
+### 빌드된 이미지를 Compose에서 사용
+
+기존 vllm service가 있는 Compose 프로젝트에 다음 service와 volume을 추가합니다. VLLM_MODEL에는 실제 제공하는 모델 이름, DOCKER_SOCKET_GID에는 `stat -c '%g' /var/run/docker.sock`으로 확인한 숫자 group ID를 설정합니다. 인증을 사용하는 API라면 VLLM_API_KEY도 설정합니다. 두 service는 같은 network에 있어야 합니다.
+
+```yaml
+services:
+  vllm-watchdog:
+    image: ghcr.io/pyg410/vllm-self-healer:v0.1.0
+    restart: unless-stopped
+    environment:
+      VLLM_BASE_URL: http://vllm:8000
+      VLLM_CONTAINER_NAME: vllm
+      VLLM_MODEL: ${VLLM_MODEL:?Set the served model name}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      STATE_FILE: /data/watchdog_state.json
+    group_add:
+      - "${DOCKER_SOCKET_GID:?Set the Docker socket group ID}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - watchdog-data:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 90s
+
+volumes:
+  watchdog-data:
+```
+
+합친 설정을 compose.yml로 저장하고 환경변수를 설정한 뒤 실행합니다.
+
+```sh
+docker compose pull vllm-watchdog
+docker compose up -d vllm-watchdog
+```
+
+소스 빌드용 [docker-compose.example.yml](docker-compose.example.yml)도 유지합니다. 해당 파일에서 빌드된 이미지를 사용하려면 watchdog의 `build: .`을 위 `image:` 항목으로 교체하고 `--build`를 생략합니다. 아래의 로컬 빌드 방법도 그대로 사용할 수 있습니다.
+
+### 자동 게시와 버전 릴리스
+
+[게시 workflow](.github/workflows/docker-publish.yml)는 Docker Buildx, arm64용 QEMU, GitHub Actions layer cache를 사용합니다. amd64 이미지를 빌드하고 이미지 내부 테스트 및 기본 CMD, non-root 시작, 상태 저장, 정상 종료를 확인한 뒤 게시합니다. 게시 후에는 digest로 이미지를 pull하여 두 아키텍처에서 Python import를 확인합니다. 실제 vLLM/GPU 환경을 검증하는 과정은 아닙니다.
+
+| Push 이벤트 | 생성 태그 |
+|---|---|
+| 기본 브랜치 master | latest 및 sha-xxxxxxxx |
+| v* 패턴의 Git 태그 | Git 태그 원문(예: v0.1.0) 및 sha-xxxxxxxx |
+
+SHA 태그는 커밋 SHA의 앞 8자리입니다. 버전 태그 push는 latest를 변경하지 않습니다. 저장소 기본 브랜치 이름을 바꾸면 workflow의 branch filter도 수정해야 합니다. 릴리스 버전은 재사용하지 마세요. 의존성과 base image 업데이트를 허용하므로 태그를 다시 빌드하면 이미지가 달라질 수 있습니다. 정확히 동일한 결과물이 필요하면 image digest를 고정합니다.
+
+릴리스할 커밋에 workflow가 포함된 것을 확인한 뒤:
+
+```sh
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+저장소 Actions 탭에서 **Build and Push Docker Image** 성공을 확인하고 이미지를 받습니다.
+
+```sh
+docker pull ghcr.io/pyg410/vllm-self-healer:v0.1.0
+```
+
+게시는 기본 GITHUB_TOKEN으로 인증하며 contents: read와 packages: write만 부여합니다. Workflow용 별도 PAT나 repository secret은 필요하지 않습니다. 저장소/조직 정책에서 GitHub Actions와 package 게시가 허용되어야 합니다. Package가 이미 있다면 이 저장소에 Actions 쓰기 권한이 있는지도 확인합니다.
+
+### Public과 Private package
+
+새 GHCR package는 기본적으로 private입니다. 인증 없는 pull을 허용하려면 GitHub Packages의 해당 package에서 **Package settings → Danger Zone → Change visibility**를 열어 **Public**으로 변경합니다. 저장소가 public이어도 package가 자동으로 public이 되지는 않습니다. Public package는 위 docker pull 명령만으로 받을 수 있습니다.
+
+Private package는 접근 권한이 있는 계정으로 인증합니다.
+
+```sh
+docker login ghcr.io
+```
+
+로컬에서 수동 로그인할 때는 read:packages 권한의 적절한 personal access token(classic)을 비밀번호로 사용하며 소스 파일이나 로그에 넣지 않습니다. 이 로컬 pull 인증정보는 workflow가 자동으로 사용하는 GITHUB_TOKEN과 별개입니다. [GitHub Container registry 문서](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)를 참고하세요.
+
+### 폐쇄망 반입
+
+외부망 PC에서 목적지 아키텍처에 맞춰 pull하고 저장합니다(필요하면 linux/arm64로 변경).
+
+```sh
+docker pull --platform linux/amd64 ghcr.io/pyg410/vllm-self-healer:v0.1.0
+docker save \
+  -o vllm-self-healer-v0.1.0.tar \
+  ghcr.io/pyg410/vllm-self-healer:v0.1.0
+```
+
+허용된 절차로 tar 파일을 옮긴 뒤 폐쇄망 서버에서:
+
+```sh
+docker load -i vllm-self-healer-v0.1.0.tar
+```
+
+Archive에는 외부망 PC에서 pull한 아키텍처가 들어가므로 목적지와 일치시켜야 합니다. 사내 Nexus 또는 Harbor가 있다면 로드한 이미지를 retag하고 push할 수 있습니다(예시 registry/project를 실제 주소로 변경).
+
+```sh
+docker tag ghcr.io/pyg410/vllm-self-healer:v0.1.0 registry.example.com/ai/vllm-self-healer:v0.1.0
+docker push registry.example.com/ai/vllm-self-healer:v0.1.0
+```
+
+Compose의 image 경로도 변경합니다. 폐쇄망용 vLLM 이미지와 모델 가중치는 별도로 준비해야 합니다. 이 archive에는 watchdog만 들어 있습니다.
+
 ## Docker Compose 실행
 
 Linux Docker Engine, NVIDIA Container Toolkit, GPU 및 GPU device reservation을 지원하는 Docker Compose가 필요합니다.

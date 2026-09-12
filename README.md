@@ -75,6 +75,128 @@ All settings are read from environment variables. Durations are in seconds and m
 
 Compose-only variables: VLLM_IMAGE (the example uses latest; pin a validated version/digest in production) and DOCKER_SOCKET_GID (the numeric group ID of the host socket). See [.env.example](.env.example) for all settings.
 
+## Docker image installation
+
+Prebuilt watchdog images are published at **ghcr.io/pyg410/vllm-self-healer**. You can pull them without cloning this repository or building locally. Both linux/amd64 and linux/arm64 are built; the watchdog itself does not perform GPU computation. Your separate vLLM deployment still needs a compatible GPU environment.
+
+Pull the latest default-branch build:
+
+```sh
+docker pull ghcr.io/pyg410/vllm-self-healer:latest
+```
+
+Prefer a released version in production:
+
+```sh
+docker pull ghcr.io/pyg410/vllm-self-healer:v0.1.0
+```
+
+The v0.1.0 commands are release examples: that image becomes available only after the corresponding Git tag is pushed and its publishing workflow succeeds. Existing tags such as v0.0.1 are not built retroactively when the workflow is added.
+
+### Compose with a prebuilt image
+
+Add the following service and volume to the Compose project containing your existing vllm service. Set VLLM_MODEL to the exact served model name and DOCKER_SOCKET_GID to the numeric socket group from `stat -c '%g' /var/run/docker.sock`. For an authenticated API, also set VLLM_API_KEY. Both services must share a network.
+
+```yaml
+services:
+  vllm-watchdog:
+    image: ghcr.io/pyg410/vllm-self-healer:v0.1.0
+    restart: unless-stopped
+    environment:
+      VLLM_BASE_URL: http://vllm:8000
+      VLLM_CONTAINER_NAME: vllm
+      VLLM_MODEL: ${VLLM_MODEL:?Set the served model name}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      STATE_FILE: /data/watchdog_state.json
+    group_add:
+      - "${DOCKER_SOCKET_GID:?Set the Docker socket group ID}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - watchdog-data:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 90s
+
+volumes:
+  watchdog-data:
+```
+
+After saving the combined configuration as compose.yml and setting its environment:
+
+```sh
+docker compose pull vllm-watchdog
+docker compose up -d vllm-watchdog
+```
+
+The source-based [docker-compose.example.yml](docker-compose.example.yml) remains available. To use a prebuilt image there, replace the watchdog's `build: .` with the `image:` line above and omit `--build`. The local build instructions below are unchanged.
+
+### Publishing and version releases
+
+[The publishing workflow](.github/workflows/docker-publish.yml) uses Docker Buildx, QEMU for arm64, and GitHub Actions layer caching. It builds an amd64 image, runs the tests inside it, and checks the default command, non-root startup, state persistence, and graceful shutdown before publishing. After publishing, it pulls the image by digest and checks Python imports on both architectures. This does not exercise an actual vLLM/GPU deployment.
+
+| Push event | Published tags |
+|---|---|
+| Default branch master | latest and sha-xxxxxxxx |
+| Git tag matching v* | Exact Git tag (for example v0.1.0) and sha-xxxxxxxx |
+
+SHA tags use the first eight characters of the commit SHA. A version-tag push does not update latest. If the repository default branch is renamed, update the workflow's branch filter too. Use each release version only once; rebuilding a tag can produce a different image because dependency/base-image updates are allowed. Pin an image digest when you need an exact immutable artifact.
+
+After the workflow is present on the commit you want to release:
+
+```sh
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+Wait for **Build and Push Docker Image** to succeed in the repository's Actions tab, then pull:
+
+```sh
+docker pull ghcr.io/pyg410/vllm-self-healer:v0.1.0
+```
+
+Publishing authenticates with the built-in GITHUB_TOKEN and grants only contents: read and packages: write. No separate PAT or repository secret is required for the workflow. GitHub Actions and package publishing must be allowed by repository/organization policy. If the package already exists, ensure this repository has Actions write access to it.
+
+### Public and private packages
+
+New GHCR packages are private by default. To allow anonymous pulls, open the package in GitHub Packages, go to **Package settings → Danger Zone → Change visibility**, and set it to **Public**. Making the repository public alone does not make its package public. A public package can be downloaded with the docker pull commands above without login.
+
+For a private package, authenticate using an account with package access:
+
+```sh
+docker login ghcr.io
+```
+
+For manual local authentication, use an appropriate personal access token (classic) with read:packages as the password; do not put it in source files or logs. This local pull credential is separate from the workflow's automatic GITHUB_TOKEN. See [GitHub's Container registry documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
+
+### Transfer to an offline network
+
+On an internet-connected machine, pull for the destination architecture (use linux/arm64 instead if needed) and export:
+
+```sh
+docker pull --platform linux/amd64 ghcr.io/pyg410/vllm-self-healer:v0.1.0
+docker save \
+  -o vllm-self-healer-v0.1.0.tar \
+  ghcr.io/pyg410/vllm-self-healer:v0.1.0
+```
+
+Transfer the tar file through your approved process, then on the offline server:
+
+```sh
+docker load -i vllm-self-healer-v0.1.0.tar
+```
+
+The archive contains the architecture pulled on the connected machine, so match it to the destination. To distribute through an internal Nexus or Harbor registry, retag and push the loaded image (replace the example registry/project):
+
+```sh
+docker tag ghcr.io/pyg410/vllm-self-healer:v0.1.0 registry.example.com/ai/vllm-self-healer:v0.1.0
+docker push registry.example.com/ai/vllm-self-healer:v0.1.0
+```
+
+Update Compose's image reference accordingly. Provision the vLLM image and model weights separately for offline use; this archive contains only the watchdog.
+
 ## Running with Docker Compose
 
 Requires Linux Docker Engine, NVIDIA Container Toolkit, a GPU, and Docker Compose with GPU device reservation support.
