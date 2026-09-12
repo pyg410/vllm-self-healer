@@ -1,0 +1,46 @@
+services:
+  vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    container_name: ${VLLM_CONTAINER_NAME:-vllm}
+    restart: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: ["--model", "${VLLM_MODEL:?Set VLLM_MODEL in .env}"]
+    environment:
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+    volumes:
+      - model-cache:/root/.cache/huggingface
+    # API remains on the Compose network. Publish a host port only if needed.
+
+  vllm-watchdog:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://vllm:8000}
+      VLLM_CONTAINER_NAME: ${VLLM_CONTAINER_NAME:-vllm}
+      STATE_FILE: /data/watchdog_state.json
+    group_add:
+      - "${DOCKER_SOCKET_GID:?Set Docker socket group ID in .env}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - watchdog-data:/data
+    depends_on:
+      - vllm
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Allows an in-flight Docker API deadline plus webhook and persistence.
+    stop_grace_period: 90s
+
+volumes:
+  watchdog-data:
+  model-cache:
