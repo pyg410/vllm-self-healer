@@ -2,260 +2,793 @@
 
 [English](README.md) | **한국어**
 
-Docker Compose에서 실행 중인 vLLM의 **프로세스는 살아 있지만 inference가 멈춘 상태**를 탐지하고 복구하는 독립 Python watchdog입니다. 단일 동기 프로세스이며 별도 HTTP 서버는 없습니다.
+> **프로세스는 살아 있지만 추론이 멈춘(alive-but-stalled) vLLM 인스턴스를 감지하고 자동으로 복구합니다.**
 
-## Architecture
+**vLLM Self-Healer**는 Docker 환경에서 실행되는 vLLM을 위한 경량 외부 watchdog입니다.
+
+일반적인 컨테이너 헬스 모니터링으로 놓칠 수 있는 다음과 같은 장애 상태를 감지합니다.
 
 ```text
-watchdog container
-  ├─ GET /health ────────────────┐
-  ├─ POST /v1/chat/completions ──┤→ vLLM container → EngineCore → GPU → decode
-  ├─ Controller + RestartPolicy ← 각각의 ProbeResult
-  ├─ Docker SDK → Docker socket → 대상 container restart
-  ├─ StateStore → /data/watchdog_state.json
-  └─ Alert → optional HTTP webhook
+Container       running
+vLLM process    alive
+GET /health     200 OK
+Inference       stalled / timeout
 ```
 
-Docker의 restart 정책은 실행 중인 프로세스의 inference 진행 여부를 확인하지 않습니다. /health 역시 실제 생성 요청의 성공을 대신할 수 없습니다. Synthetic inference probe는 별도로 고정 prompt와 작은 token budget을 보내 HTTP 입력, scheduler, model execution, decode, 응답까지 완료되는지 확인합니다.
+단순히 프로세스나 HTTP 서버가 살아 있는지만 확인하지 않고, 작은 synthetic inference request를 실제로 전송하여 **추론이 정상적으로 진행되고 있는지(forward progress)** 확인합니다.
 
-[공식 vLLM API 문서](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/)의 chat completions 형식을 사용합니다. Chat template이 있는 생성 모델이 필요합니다. 정상 응답은 HTTP 200, JSON object=chat.completion, 비어 있지 않은 choices, 정수 index, assistant message 및 stop/length finish_reason을 요구합니다. 즉시 EOS 또는 reasoning 모델의 짧은 budget을 고려해 정상 terminal 구조의 빈 content/null은 허용합니다.
+반복적인 실패가 감지되면 다음 작업을 수행할 수 있습니다.
 
-## 상태와 restart policy
+* 문제가 발생한 vLLM 컨테이너 재시작
+* 재시작 후 실제 추론 복구 여부 검증
+* 무한 재시작 루프 방지
+* watchdog 재시작 이후에도 restart history 유지
+* 선택적 webhook 알림
 
-- 최초 실행: RECOVERING → startup grace → 두 probe 성공 → HEALTHY.
-- 정상 감시: 하나라도 실패하면 SUSPECT. 두 probe를 매 iteration에서 독립적으로 실행합니다.
-- 각각의 연속 실패 카운터가 FAILURE_THRESHOLD에 도달하면 재시작을 시도합니다.
-- health=true/inference=false는 ALIVE_BUT_STALLED로 기록하고 상세 timeout/HTTP/응답 오류도 별도로 기록합니다.
-- health=false/inference=true도 health 카운터가 임계치에 도달하면 재시작합니다.
-- 성공은 **해당 probe의 카운터만** 0으로 초기화합니다. /health 성공으로 inference 장애 카운터를 지우면 hang을 탐지할 수 없기 때문입니다.
-- RESTARTING → Docker 호출 → RECOVERING. STARTUP_GRACE_PERIOD 동안 기다린 뒤, RECOVERY_TIMEOUT 동안 RECOVERY_CHECK_INTERVAL 간격으로 확인합니다. Timeout은 grace **이후부터** 계산합니다.
-- 복구는 두 probe가 같은 iteration에 성공한 경우에만 인정합니다. 복구 timeout은 다시 재시작 정책을 거칩니다.
-- RESTART_COOLDOWN은 재시작 시도 시작 시간 사이의 최소 간격입니다. 두 probe가 회복하면 cooldown 중에도 HEALTHY로 돌아갑니다.
+watchdog 자체에는 GPU가 필요하지 않습니다.
 
-각 주기는 작업 **완료 후** 대기 시간입니다. 요청은 겹치지 않으며 정상 감시 iteration은 두 probe timeout의 합만큼 추가로 걸릴 수 있습니다. 복구 중에는 남은 복구 시간으로 각 HTTP deadline을 줄입니다.
+---
 
-### 무한 재시작 방지
+## 왜 필요한가?
 
-최근 RESTART_WINDOW 내 MAX_RESTARTS회까지 시도를 허용합니다. 마지막 허용 시도도 복구 검증을 받으며, 그 후 추가 재시작이 필요하면 FAILED로 고정됩니다. 또한 **복구 성공 없이 MAX_RESTARTS회 시도**하면 시간 구간이 지나도 더 재시작하지 않습니다. 긴 모델 로딩으로 rolling window가 만료되는 반복을 방지합니다. 검증 성공은 연속 복구 시도 횟수만 초기화하며 최근 재시작 이력은 유지합니다.
+Docker restart policy는 프로세스가 종료되었을 때 유용합니다.
 
-이력은 deque로 관리하며 JSON에 atomic replace + fsync로 저장합니다. Cooldown이 window보다 길어도 적용되도록 마지막 timestamp는 보존합니다. Docker API 호출 **전에** 시도를 저장하므로 daemon unavailable, permission error, timeout도 예산을 소비합니다. Docker timeout은 서버 측 성공 여부가 불명확하므로 즉시 재호출하지 않고 복구를 확인합니다. [Docker SDK](https://docker-py.readthedocs.io/en/stable/containers.html)의 stop timeout과 전체 API deadline을 별도로 설정합니다.
+하지만 프로세스는 살아 있으면서 실제 서비스가 더 이상 진행되지 않는 상태는 복구하지 못합니다.
 
-FAILED도 저장하므로 watchdog 컨테이너를 다시 시작해도 자동 해제되지 않습니다. 파일 손상/읽기/쓰기 오류는 재시작을 차단하고 alert를 시도합니다. 손상 파일은 진단을 위해 덮어쓰지 않습니다. 상태 저장 경로의 lock으로 같은 파일을 사용하는 중복 프로세스를 방지합니다.
+vLLM에서도 비슷한 상황이 발생할 수 있습니다.
 
-FAILED 해제: watchdog을 정지하고 원인을 해결한 뒤 상태 JSON을 백업하고 해당 파일만 삭제하여 재기동합니다. 이 작업은 재시작 예산도 초기화합니다. 다른 데이터가 있는 volume 전체를 삭제하지 마세요.
+```text
+HTTP API
+   ↓
+EngineCore
+   ↓
+Scheduler
+   ↓
+ModelRunner
+   ↓
+CUDA / NCCL
+   ↓
+GPU
+```
 
-## Configuration
+이 경로의 더 깊은 계층에서 문제가 발생하더라도 HTTP 서버 자체는 계속 응답할 수 있습니다.
 
-모든 변수는 환경변수로 읽습니다. 시간 단위는 초이며 양수여야 합니다(grace, cooldown, Docker stop timeout은 0 허용). 잘못된 값은 시작 시 거부합니다.
+실제로 이러한 유형의 문제가 vLLM upstream에서도 보고되어 있습니다.
 
-| 환경변수 | 기본값 | 의미 |
-|---|---|---|
-| VLLM_BASE_URL | http://vllm:8000 | API base URL |
-| VLLM_CONTAINER_NAME | vllm | Docker 대상 이름/ID |
-| VLLM_MODEL | 필수 | API에 제공되는 정확한 model 이름 |
-| VLLM_API_KEY | 빈 값 | Bearer 인증, 로그 출력 금지 |
-| PROBE_PROMPT | ping | 고정 synthetic prompt |
-| PROBE_MAX_TOKENS | 1 | 생성 token budget |
-| CHECK_INTERVAL | 30 | 정상 감시 대기 |
-| HEALTH_TIMEOUT | 5 | /health 전체 요청 deadline |
-| INFERENCE_TIMEOUT | 15 | inference 전체 요청 deadline |
-| FAILURE_THRESHOLD | 3 | probe별 연속 실패 임계치 |
-| STARTUP_GRACE_PERIOD | 300 | 최초/재시작 후 모델 로딩 유예 |
-| RECOVERY_CHECK_INTERVAL | 10 | 복구 확인 간격 |
-| RECOVERY_TIMEOUT | 600 | grace 후 복구 제한 시간 |
-| RESTART_COOLDOWN | 300 | 재시작 시도 최소 간격 |
-| RESTART_WINDOW | 600 | rolling restart window |
-| MAX_RESTARTS | 3 | window 내/미복구 연속 최대 시도 |
-| DOCKER_STOP_TIMEOUT | 30 | 강제 종료 전 대기 |
-| DOCKER_API_TIMEOUT | 60 | Docker 작업 전체 deadline, stop timeout보다 커야 함 |
-| ALERT_WEBHOOK_URL | 빈 값 | 빈 값이면 alert 비활성 |
-| ALERT_TIMEOUT | 5 | webhook 전체 요청 deadline |
-| STATE_FILE | /data/watchdog_state.json | 영속 상태 경로 |
-| LOG_LEVEL | INFO | DEBUG/INFO/WARNING/ERROR/CRITICAL |
+| Upstream 사례                   | 증상                                                                          |
+| ----------------------------- | --------------------------------------------------------------------------- |
+| `vllm-project/vllm #52319`    | `/health`와 `/metrics`가 HTTP 200을 반환하지만 generation이 완전히 중단됨                  |
+| `vllm-project/vllm #52247`    | EngineCore가 GPU synchronization event에서 멈춰 있지만 `/health`는 계속 200을 반환        |
+| `vllm-project/vllm #42897`    | 지속적인 트래픽 중 token generation이 멈추지만 HTTP 계층은 계속 응답                            |
+| `vllm-project/vllm #36960`    | process liveness만으로 inference availability를 보장할 수 없어 GPU-aware readiness 제안 |
+| `vllm-project/vllm PR #36451` | alive-but-hung 상태를 감지하기 위해 EngineCore forward-progress detection 추가         |
 
-Compose 전용 변수: VLLM_IMAGE(예시는 latest, 운영에서는 검증한 버전/digest로 고정), DOCKER_SOCKET_GID(호스트 socket의 숫자 group ID). .env.example에 전체 설정이 있습니다.
+예를 들어 upstream issue #52247에서는 GPU kernel이 종료되지 않아 EngineCore가 살아 있는 상태로 멈추고, `/health`는 계속 HTTP 200을 반환했지만 실제 inference는 장시간 제공되지 않은 production incident가 보고되었습니다.
 
-## Docker 이미지 설치
+이 프로젝트는 이러한 빈틈을 외부에서 보완하는 것을 목표로 합니다.
 
-빌드된 watchdog 이미지는 **ghcr.io/pyg410/vllm-self-healer**에 게시됩니다. 저장소를 clone하거나 직접 빌드하지 않고 받을 수 있습니다. linux/amd64와 linux/arm64를 빌드하며 watchdog 자체는 GPU 연산을 하지 않습니다. 별도로 운영하는 vLLM에는 호환되는 GPU 환경이 필요합니다.
+단순히 다음만 확인하는 대신,
 
-기본 브랜치의 최신 빌드:
+```text
+프로세스가 살아 있는가?
+```
 
-```sh
+한 가지를 더 확인합니다.
+
+```text
+이 인스턴스가 실제 inference request를 완료할 수 있는가?
+```
+
+---
+
+## 동작 방식
+
+각 monitoring cycle에서는 두 가지 probe를 독립적으로 실행합니다.
+
+### 1. Health probe
+
+```http
+GET /health
+```
+
+vLLM engine의 기본적인 health 상태를 확인합니다.
+
+### 2. Synthetic inference probe
+
+```http
+POST /v1/chat/completions
+```
+
+다음과 같은 최소 크기의 요청을 전송합니다.
+
+```json
+{
+  "model": "your-model",
+  "messages": [
+    {
+      "role": "user",
+      "content": "ping"
+    }
+  ],
+  "max_tokens": 1,
+  "temperature": 0
+}
+```
+
+이를 통해 단순한 HTTP 응답 여부보다 더 깊은 inference path를 확인합니다.
+
+정상적인 inference probe는 다음 경로가 실제로 동작하고 있음을 외부에서 검증합니다.
+
+```text
+HTTP request
+    ↓
+request processing
+    ↓
+scheduler
+    ↓
+model execution
+    ↓
+GPU
+    ↓
+decode
+    ↓
+completed response
+```
+
+health probe와 inference probe는 **서로 독립적인 failure counter**를 유지합니다.
+
+따라서 `/health` 요청이 성공했다고 해서 inference failure counter가 초기화되지 않습니다.
+
+이 구분이 alive-but-stalled 상태를 감지하는 핵심입니다.
+
+---
+
+## 상태 머신
+
+```text
+                  ┌─────────────┐
+                  │   HEALTHY   │
+                  └──────┬──────┘
+                         │
+                    probe failure
+                         │
+                         ▼
+                  ┌─────────────┐
+                  │   SUSPECT   │
+                  └──────┬──────┘
+                         │
+              consecutive failures
+                         │
+                         ▼
+                 ┌──────────────┐
+                 │  RESTARTING  │
+                 └──────┬───────┘
+                        │
+                  Docker restart
+                        │
+                        ▼
+                 ┌──────────────┐
+                 │  RECOVERING  │
+                 └──────┬───────┘
+                        │
+               health + inference
+                    ┌───┴───┐
+                    │       │
+                  success   timeout
+                    │       │
+                    ▼       ▼
+                 HEALTHY   retry policy
+                              │
+                        restart limit
+                              │
+                              ▼
+                           FAILED
+```
+
+### HEALTHY
+
+두 probe가 모두 정상적으로 성공하고 있는 상태입니다.
+
+### SUSPECT
+
+하나 이상의 probe가 실패했지만 아직 설정된 failure threshold에 도달하지 않은 상태입니다.
+
+### RESTARTING
+
+watchdog이 restart attempt를 기록하고 Docker를 통해 대상 vLLM 컨테이너 재시작을 요청합니다.
+
+### RECOVERING
+
+설정된 startup grace period 이후 두 probe를 반복적으로 실행합니다.
+
+다음 두 조건이 **같은 recovery iteration에서 모두 성공해야** 복구된 것으로 판단합니다.
+
+```text
+health probe    = success
+inference probe = success
+```
+
+### FAILED
+
+restart budget을 모두 소진했거나 persistent state를 안전하게 유지할 수 없는 경우 자동 복구를 중단합니다.
+
+`FAILED` 상태는 의도적으로 persistent state에 저장됩니다.
+
+따라서 watchdog 컨테이너만 재시작해서 recovery budget이 자동으로 초기화되지는 않습니다.
+
+---
+
+## Alive-but-stalled 감지
+
+특히 중요한 상태는 다음과 같습니다.
+
+```text
+health     = success
+inference  = failure
+```
+
+watchdog은 이 상태를 다음과 같이 기록합니다.
+
+```text
+ALIVE_BUT_STALLED
+```
+
+예를 들어:
+
+```text
+03:21:01  health probe       success
+03:21:05  inference probe    timeout
+
+03:21:31  health probe       success
+03:21:35  inference probe    timeout
+
+03:22:01  health probe       success
+03:22:05  inference probe    timeout
+
+failure threshold reached
+
+03:22:05  ALIVE_BUT_STALLED
+03:22:05  RESTART_TRIGGERED
+```
+
+재시작 이후에는:
+
+```text
+RECOVERING
+
+health     success
+inference  success
+
+RECOVERY_SUCCESS
+HEALTHY
+```
+
+처럼 실제 inference가 다시 정상적으로 완료되는지 확인합니다.
+
+---
+
+## Restart loop 방지
+
+무조건적인 자동 재시작은 오히려 장애 상황을 악화시킬 수 있습니다.
+
+따라서 vLLM Self-Healer는 **bounded recovery** 방식을 사용합니다.
+
+restart timestamp를 기록하고 설정된 시간 범위 내에서 허용되는 restart attempt 수를 제한합니다.
+
+예를 들어:
+
+```text
+MAX_RESTARTS=3
+RESTART_WINDOW=600
+```
+
+이면 10분 동안 최대 3회의 restart attempt를 허용합니다.
+
+마지막으로 허용된 restart 이후에도 정상적인 recovery verification을 수행합니다.
+
+복구되지 않아 추가 restart가 필요한 상황이 되면 무한히 재시작하는 대신:
+
+```text
+FAILED
+```
+
+상태로 전환합니다.
+
+별도의 restart cooldown도 적용하여 짧은 시간 동안 반복적인 restart call이 발생하지 않도록 합니다.
+
+---
+
+## Persistent state
+
+Restart history는 기본적으로 다음 경로에 저장됩니다.
+
+```text
+/data/watchdog_state.json
+```
+
+state는 atomic file replacement와 `fsync`를 사용하여 저장됩니다.
+
+restart attempt는 **Docker restart API를 호출하기 전에** 먼저 기록됩니다.
+
+이는 Docker API timeout이 발생했다고 해서 실제 서버 측 restart까지 실패했다고 단정할 수 없기 때문입니다.
+
+결과가 불확실한 경우 watchdog은 즉시 또 재시작하지 않고 recovery 상태를 먼저 검증합니다.
+
+state corruption이나 persistence failure가 발생한 경우 restart history를 조용히 폐기하는 대신 자동 restart를 차단합니다.
+
+의도적으로 `FAILED` 상태를 초기화하려면:
+
+1. watchdog을 중지합니다.
+2. 근본적인 장애 원인을 해결합니다.
+3. 필요하면 state file을 백업합니다.
+4. watchdog state JSON 파일만 삭제합니다.
+5. watchdog을 다시 시작합니다.
+
+이 과정에서 restart budget도 초기화됩니다.
+
+---
+
+## 주요 기능
+
+* **alive-but-stalled vLLM 인스턴스 감지**
+* `/health` probe
+* 실제 synthetic inference probe
+* health/inference 독립 failure counter
+* consecutive failure threshold
+* Docker 컨테이너 자동 재시작
+* startup grace period
+* 재시작 후 recovery verification
+* restart cooldown
+* rolling restart budget
+* restart-loop protection
+* persistent recovery state
+* 선택적 webhook alert
+* structured JSON logging
+* graceful SIGTERM / SIGINT 처리
+* non-root container
+* read-only container 환경 지원
+* `linux/amd64`
+* `linux/arm64`
+* watchdog 자체는 GPU 불필요
+
+---
+
+# 빠른 시작
+
+## 이미지 Pull
+
+```bash
 docker pull ghcr.io/pyg410/vllm-self-healer:latest
 ```
 
-운영환경에서는 릴리스 버전 사용을 권장합니다.
+production 환경에서는 release version 사용을 권장합니다.
 
-```sh
+```bash
 docker pull ghcr.io/pyg410/vllm-self-healer:v0.1.0
 ```
 
-v0.1.0 명령어는 릴리스 예시입니다. 해당 Git 태그를 push하고 게시 workflow가 성공한 뒤에 사용할 수 있습니다. Workflow를 추가해도 기존 v0.0.1 등의 태그를 소급하여 빌드하지 않습니다.
+완전히 동일한 artifact를 고정해야 한다면 image digest를 사용할 수 있습니다.
 
-### 빌드된 이미지를 Compose에서 사용
+---
 
-기존 vllm service가 있는 Compose 프로젝트에 다음 service와 volume을 추가합니다. VLLM_MODEL에는 실제 제공하는 모델 이름, DOCKER_SOCKET_GID에는 `stat -c '%g' /var/run/docker.sock`으로 확인한 숫자 group ID를 설정합니다. 인증을 사용하는 API라면 VLLM_API_KEY도 설정합니다. 두 service는 같은 network에 있어야 합니다.
+## Docker Compose
+
+기존 vLLM service 옆에 watchdog을 추가합니다.
 
 ```yaml
 services:
-  vllm-watchdog:
+
+  vllm:
+    # 기존 vLLM 설정
+
+  vllm-self-healer:
     image: ghcr.io/pyg410/vllm-self-healer:v0.1.0
     restart: unless-stopped
+
     environment:
       VLLM_BASE_URL: http://vllm:8000
       VLLM_CONTAINER_NAME: vllm
-      VLLM_MODEL: ${VLLM_MODEL:?Set the served model name}
+      VLLM_MODEL: ${VLLM_MODEL}
+
       VLLM_API_KEY: ${VLLM_API_KEY:-}
+
       STATE_FILE: /data/watchdog_state.json
+
     group_add:
-      - "${DOCKER_SOCKET_GID:?Set the Docker socket group ID}"
+      - "${DOCKER_SOCKET_GID}"
+
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - watchdog-data:/data
+
     read_only: true
+
     security_opt:
       - no-new-privileges:true
+
     cap_drop:
       - ALL
+
     stop_grace_period: 90s
 
 volumes:
   watchdog-data:
 ```
 
-합친 설정을 compose.yml로 저장하고 환경변수를 설정한 뒤 실행합니다.
+Docker socket의 group ID를 확인합니다.
 
-```sh
-docker compose pull vllm-watchdog
-docker compose up -d vllm-watchdog
+```bash
+stat -c '%g' /var/run/docker.sock
 ```
 
-소스 빌드용 [docker-compose.example.yml](docker-compose.example.yml)도 유지합니다. 해당 파일에서 빌드된 이미지를 사용하려면 watchdog의 `build: .`을 위 `image:` 항목으로 교체하고 `--build`를 생략합니다. 아래의 로컬 빌드 방법도 그대로 사용할 수 있습니다.
+실행:
 
-### 자동 게시와 버전 릴리스
+```bash
+docker compose up -d vllm-self-healer
+```
 
-[게시 workflow](.github/workflows/docker-publish.yml)는 Docker Buildx, arm64용 QEMU, GitHub Actions layer cache를 사용합니다. amd64 이미지를 빌드하고 이미지 내부 테스트 및 기본 CMD, non-root 시작, 상태 저장, 정상 종료를 확인한 뒤 게시합니다. 게시 후에는 digest로 이미지를 pull하여 두 아키텍처에서 Python import를 확인합니다. 실제 vLLM/GPU 환경을 검증하는 과정은 아닙니다.
+로그 확인:
 
-| Push 이벤트 | 생성 태그 |
-|---|---|
-| 기본 브랜치 master | latest 및 sha-xxxxxxxx |
-| v* 패턴의 Git 태그 | Git 태그 원문(예: v0.1.0) 및 sha-xxxxxxxx |
+```bash
+docker compose logs -f vllm-self-healer
+```
 
-SHA 태그는 커밋 SHA의 앞 8자리입니다. 버전 태그 push는 latest를 변경하지 않습니다. 저장소 기본 브랜치 이름을 바꾸면 workflow의 branch filter도 수정해야 합니다. 릴리스 버전은 재사용하지 마세요. 의존성과 base image 업데이트를 허용하므로 태그를 다시 빌드하면 이미지가 달라질 수 있습니다. 정확히 동일한 결과물이 필요하면 image digest를 고정합니다.
+두 컨테이너는 동일한 Docker network를 통해 서로 통신할 수 있어야 합니다.
 
-릴리스할 커밋에 workflow가 포함된 것을 확인한 뒤:
+`VLLM_CONTAINER_NAME`에는 watchdog이 실제로 재시작할 vLLM 컨테이너를 지정해야 합니다.
 
-```sh
+---
+
+# 설정
+
+모든 설정은 environment variable을 통해 지정합니다.
+
+시간 관련 설정의 단위는 초입니다.
+
+| Variable                  |                     Default | 설명                                      |
+| ------------------------- | --------------------------: | --------------------------------------- |
+| `VLLM_BASE_URL`           |          `http://vllm:8000` | vLLM API base URL                       |
+| `VLLM_CONTAINER_NAME`     |                      `vllm` | 재시작할 Docker container name 또는 ID        |
+| `VLLM_MODEL`              |                          필수 | vLLM이 제공하는 정확한 model name               |
+| `VLLM_API_KEY`            |                       empty | 선택적 Bearer token                        |
+| `PROBE_PROMPT`            |                      `ping` | synthetic inference prompt              |
+| `PROBE_MAX_TOKENS`        |                         `1` | 최대 generation token 수                   |
+| `CHECK_INTERVAL`          |                        `30` | 일반 monitoring interval                  |
+| `HEALTH_TIMEOUT`          |                         `5` | `/health` request deadline              |
+| `INFERENCE_TIMEOUT`       |                        `15` | inference probe deadline                |
+| `FAILURE_THRESHOLD`       |                         `3` | restart 전 연속 실패 횟수                      |
+| `STARTUP_GRACE_PERIOD`    |                       `300` | watchdog startup/restart 후 grace period |
+| `RECOVERY_CHECK_INTERVAL` |                        `10` | recovery probe interval                 |
+| `RECOVERY_TIMEOUT`        |                       `600` | 최대 recovery verification 시간             |
+| `RESTART_COOLDOWN`        |                       `300` | restart attempt 사이 최소 간격                |
+| `RESTART_WINDOW`          |                       `600` | rolling restart history window          |
+| `MAX_RESTARTS`            |                         `3` | 최대 restart attempt                      |
+| `DOCKER_STOP_TIMEOUT`     |                        `30` | Docker stop timeout                     |
+| `DOCKER_API_TIMEOUT`      |                        `60` | 전체 Docker API deadline                  |
+| `ALERT_WEBHOOK_URL`       |                       empty | 선택적 webhook endpoint                    |
+| `ALERT_TIMEOUT`           |                         `5` | webhook request deadline                |
+| `STATE_FILE`              | `/data/watchdog_state.json` | persistent watchdog state               |
+| `LOG_LEVEL`               |                      `INFO` | logging level                           |
+
+전체 설정값은 `.env.example`에서도 확인할 수 있습니다.
+
+---
+
+# Probe 검증 방식
+
+## Health validation
+
+health probe는 `/health` 요청의 정상 응답을 확인합니다.
+
+## Inference validation
+
+generation request는 단순히 HTTP 200만 반환한다고 성공으로 처리하지 않습니다.
+
+정상적인 OpenAI-compatible terminal chat completion 구조인지 확인합니다.
+
+예를 들어 다음 항목을 검증합니다.
+
+* HTTP status
+* JSON object 구조
+* completion object type
+* `choices`
+* choice index
+* assistant message
+* terminal `finish_reason`
+
+아주 작은 token budget에서 immediate EOS가 발생하거나 reasoning model의 특수한 응답이 발생할 수 있으므로, 정상적인 terminal completion 구조라면 assistant content가 empty 또는 null이어도 성공으로 처리할 수 있습니다.
+
+---
+
+# Timing 동작
+
+watchdog은 **single synchronous control loop**로 동작합니다.
+
+probe 요청은 서로 겹쳐서 실행되지 않습니다.
+
+따라서 최악의 경우 일반 monitoring iteration은 대략:
+
+```text
+iteration duration
+≈ health probe
++ inference probe
++ CHECK_INTERVAL
+```
+
+이 됩니다.
+
+recovery 중에는 각 I/O deadline이 남아 있는 전체 recovery deadline을 초과하지 않도록 제한됩니다.
+
+이 설계는 고빈도 concurrent probing보다 예측 가능한 recovery 동작을 우선합니다.
+
+---
+
+# Logging
+
+로그는 structured JSON 형태로 stdout에 출력됩니다.
+
+대표적인 event:
+
+```text
+HEALTHY
+SUSPECT
+ALIVE_BUT_STALLED
+RESTART_TRIGGERED
+RECOVERING
+RECOVERY_SUCCESS
+RECOVERY_FAILED
+MAX_RESTART_EXCEEDED
+FAILED
+```
+
+restart event에는 진단을 위해 다음과 같은 정보가 포함될 수 있습니다.
+
+* reason
+* health failure count
+* inference failure count
+* restart count
+* 마지막 successful inference timestamp
+
+민감한 데이터는 의도적으로 로그에서 제외합니다.
+
+다음 정보는 기록하지 않습니다.
+
+* API key
+* Authorization header
+* inference prompt
+* response body
+* webhook URL
+
+---
+
+# Alert
+
+선택적으로 webhook을 통해 주요 recovery event를 전달할 수 있습니다.
+
+지원하는 event:
+
+```text
+RESTART_TRIGGERED
+RECOVERY_SUCCESS
+RECOVERY_FAILED
+MAX_RESTART_EXCEEDED
+```
+
+alert delivery는 best-effort 방식입니다.
+
+webhook 전송에 실패해도 monitoring control loop는 계속 동작합니다.
+
+---
+
+# Graceful shutdown
+
+`SIGTERM`과 `SIGINT`가 전달되면 대기 중인 interval을 중단하고 새로운 restart attempt를 방지합니다.
+
+진행 중인 I/O는 설정된 deadline 안에서 종료된 후 state persistence와 shutdown 절차를 수행합니다.
+
+Docker Compose에서는 가장 긴 probe/alert timeout보다 충분히 긴 `stop_grace_period`를 설정하는 것이 좋습니다.
+
+---
+
+# Docker socket 보안
+
+> **중요:** `/var/run/docker.sock` 접근 권한은 사실상 host Docker에 대한 관리자 수준의 권한을 제공합니다.
+
+Docker socket에 접근할 수 있는 process는 잠재적으로 다음 작업을 수행할 수 있습니다.
+
+* privileged container 생성
+* host filesystem mount
+* 다른 container 조회
+* 다른 Docker workload 제어
+
+watchdog을 non-root로 실행하고 Linux capability를 제거하거나 read-only filesystem을 사용하는 것은 유용한 defense-in-depth 조치입니다.
+
+하지만 이러한 설정만으로 **Docker socket 자체가 제공하는 권한까지 제한되는 것은 아닙니다.**
+
+Docker socket에 직접 접근하는 container에서는 반드시 신뢰할 수 있는 code와 image만 사용해야 합니다.
+
+더 강한 isolation이 필요한 경우 watchdog과 Docker daemon 사이에 authorization proxy를 배치하고 대상 container와 필요한 Docker operation만 허용하는 방식을 고려하십시오.
+
+socket permission 문제를 해결하기 위해 Docker socket을 world-writable로 변경하지 마십시오.
+
+---
+
+# 테스트
+
+테스트에는 Docker나 GPU가 필요하지 않습니다.
+
+```bash
+python3 -m venv .venv
+
+.venv/bin/pip install -r requirements.txt
+
+.venv/bin/python -m unittest discover -v
+```
+
+로컬 실행:
+
+```bash
+VLLM_MODEL=my-model \
+VLLM_BASE_URL=http://localhost:8000 \
+STATE_FILE=/tmp/watchdog-state.json \
+.venv/bin/python -m watchdog.main
+```
+
+test suite에는 다음 시나리오가 포함됩니다.
+
+* healthy operation
+* single probe failure
+* consecutive failure
+* inference-only failure
+* health-only failure
+* alive-but-stalled detection
+* recovery success
+* recovery timeout
+* restart limit
+* cooldown
+* state persistence
+* corrupted state
+* Docker daemon error
+* webhook failure
+* graceful shutdown
+
+---
+
+# Container Image
+
+prebuilt image는 GitHub Container Registry에 배포됩니다.
+
+```text
+ghcr.io/pyg410/vllm-self-healer
+```
+
+지원 architecture:
+
+```text
+linux/amd64
+linux/arm64
+```
+
+watchdog 자체에서는 GPU 연산을 수행하지 않습니다.
+
+별도로 실행되는 vLLM 환경에는 당연히 호환되는 GPU 환경이 필요합니다.
+
+---
+
+# Release
+
+GitHub Actions publishing workflow는 다음 tag를 생성합니다.
+
+```text
+master push
+    ├─ latest
+    └─ sha-xxxxxxxx
+
+v* tag
+    ├─ exact version tag
+    └─ sha-xxxxxxxx
+```
+
+예를 들어 `v0.1.0`을 release하려면:
+
+```bash
 git tag -a v0.1.0 -m "Release v0.1.0"
+
 git push origin v0.1.0
 ```
 
-저장소 Actions 탭에서 **Build and Push Docker Image** 성공을 확인하고 이미지를 받습니다.
+이후:
 
-```sh
+```bash
 docker pull ghcr.io/pyg410/vllm-self-healer:v0.1.0
 ```
 
-게시는 기본 GITHUB_TOKEN으로 인증하며 contents: read와 packages: write만 부여합니다. Workflow용 별도 PAT나 repository secret은 필요하지 않습니다. 저장소/조직 정책에서 GitHub Actions와 package 게시가 허용되어야 합니다. Package가 이미 있다면 이 저장소에 Actions 쓰기 권한이 있는지도 확인합니다.
+production에서는 `latest`보다 version tag 또는 immutable image digest 사용을 권장합니다.
 
-### Public과 Private package
+---
 
-새 GHCR package는 기본적으로 private입니다. 인증 없는 pull을 허용하려면 GitHub Packages의 해당 package에서 **Package settings → Danger Zone → Change visibility**를 열어 **Public**으로 변경합니다. 저장소가 public이어도 package가 자동으로 public이 되지는 않습니다. Public package는 위 docker pull 명령만으로 받을 수 있습니다.
+# 폐쇄망 배포
 
-Private package는 접근 권한이 있는 계정으로 인증합니다.
+인터넷에 연결된 환경에서 destination architecture에 맞는 이미지를 pull합니다.
 
-```sh
-docker login ghcr.io
+```bash
+docker pull --platform linux/amd64 \
+  ghcr.io/pyg410/vllm-self-healer:v0.1.0
 ```
 
-로컬에서 수동 로그인할 때는 read:packages 권한의 적절한 personal access token(classic)을 비밀번호로 사용하며 소스 파일이나 로그에 넣지 않습니다. 이 로컬 pull 인증정보는 workflow가 자동으로 사용하는 GITHUB_TOKEN과 별개입니다. [GitHub Container registry 문서](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)를 참고하세요.
+tar 파일로 저장합니다.
 
-### 폐쇄망 반입
-
-외부망 PC에서 목적지 아키텍처에 맞춰 pull하고 저장합니다(필요하면 linux/arm64로 변경).
-
-```sh
-docker pull --platform linux/amd64 ghcr.io/pyg410/vllm-self-healer:v0.1.0
+```bash
 docker save \
   -o vllm-self-healer-v0.1.0.tar \
   ghcr.io/pyg410/vllm-self-healer:v0.1.0
 ```
 
-허용된 절차로 tar 파일을 옮긴 뒤 폐쇄망 서버에서:
+승인된 절차를 통해 폐쇄망으로 파일을 전달한 뒤:
 
-```sh
+```bash
 docker load -i vllm-self-healer-v0.1.0.tar
 ```
 
-Archive에는 외부망 PC에서 pull한 아키텍처가 들어가므로 목적지와 일치시켜야 합니다. 사내 Nexus 또는 Harbor가 있다면 로드한 이미지를 retag하고 push할 수 있습니다(예시 registry/project를 실제 주소로 변경).
+로 불러올 수 있습니다.
 
-```sh
-docker tag ghcr.io/pyg410/vllm-self-healer:v0.1.0 registry.example.com/ai/vllm-self-healer:v0.1.0
-docker push registry.example.com/ai/vllm-self-healer:v0.1.0
+필요한 경우 load한 이미지를 다시 tag하여 사내 Nexus, Harbor 또는 다른 OCI-compatible registry에 배포할 수도 있습니다.
+
+---
+
+# 알려진 제한사항
+
+vLLM Self-Healer의 책임 범위는 의도적으로 제한되어 있습니다.
+
+> **Inference forward progress의 상실을 감지하고 제한된 범위에서 Docker-level recovery를 수행합니다.**
+
+근본적인 vLLM, CUDA, NCCL, driver 또는 hardware bug 자체를 진단하거나 수정하는 도구는 아닙니다.
+
+주요 제한사항:
+
+* 하나의 watchdog은 하나의 vLLM container를 대상으로 합니다.
+* restart 시 처리 중이던 request는 중단됩니다.
+* network outage가 inference stall과 유사하게 보일 수 있습니다.
+* 잘못된 authentication 또는 model configuration도 probe failure를 발생시킬 수 있습니다.
+* 극심한 overload에서는 engine 자체가 정상이어도 inference probe가 timeout될 수 있습니다.
+* 따라서 timeout과 threshold는 실제 production latency 분포에 맞게 조정해야 합니다.
+* 모든 GPU/driver 장애가 container restart만으로 복구되는 것은 아닙니다.
+* 일부 장애는 GPU reset, node isolation, driver recovery 또는 host reboot가 필요할 수 있습니다.
+* Docker socket 접근에는 강한 보안 권한이 따릅니다.
+* 서로 다른 state volume을 사용하는 여러 watchdog instance는 서로 조정되지 않습니다.
+
+restart budget을 두는 이유도 container restart만으로 복구되지 않는 host-level failure에서 무한 restart loop가 발생하는 것을 막기 위해서입니다.
+
+---
+
+# 설계 철학
+
+이 프로젝트에서는 다음 두 개념을 명확하게 구분합니다.
+
+```text
+liveness
 ```
 
-Compose의 image 경로도 변경합니다. 폐쇄망용 vLLM 이미지와 모델 가중치는 별도로 준비해야 합니다. 이 archive에는 watchdog만 들어 있습니다.
+그리고:
 
-## Docker Compose 실행
-
-Linux Docker Engine, NVIDIA Container Toolkit, GPU 및 GPU device reservation을 지원하는 Docker Compose가 필요합니다.
-
-```sh
-cp .env.example .env
-stat -c '%g' /var/run/docker.sock
-# .env의 DOCKER_SOCKET_GID에 위 숫자를 입력하고 모델/이미지/timeout을 조정합니다.
-docker compose -f docker-compose.example.yml up -d --build
-docker compose -f docker-compose.example.yml logs -f vllm-watchdog
+```text
+forward progress
 ```
 
-예시는 작은 chat 모델을 다운로드하고 GPU에서 실행합니다. 모델 접근 권한과 GPU 메모리를 확인하세요. API는 Compose 내부 network에만 노출합니다. 이미 실행 중인 Compose에는 watchdog service와 watchdog-data volume을 복사하고 build 경로를 이 프로젝트로 지정합니다. 두 service가 같은 network에 있어야 하며 VLLM_CONTAINER_NAME은 실제 대상과 일치해야 합니다. 로컬 모델 경로라면 vLLM service에 모델 volume을 추가합니다.
+프로세스가 살아 있는 것은 inference service를 제공하기 위한 **필요조건**입니다.
 
-.env의 VLLM_API_KEY를 예시의 vLLM과 watchdog에 함께 전달합니다. 인증 오류나 model 이름 오류도 장애로 집계되므로 배포 전 일치 여부를 확인하세요. depends_on은 준비 완료를 보장하지 않으므로 watchdog 자체가 초기 복구 유예를 적용합니다.
+하지만 **충분조건은 아닙니다.**
 
-이미지는 UID/GID 10001로 실행합니다. Named volume은 /data 소유권을 사용합니다. Bind mount 사용 시 디렉터리에 UID 10001 쓰기 권한을 부여해야 합니다. Socket group은 group_add로 추가하며 rootless Docker는 socket mount 경로와 GID를 조정해야 합니다. 권한 해결을 위해 socket을 world-writable로 만들지 마세요.
+따라서 watchdog은 실제 generation request가 성공적으로 완료되는 것을 serving path가 정상 동작하고 있다는 가장 강한 외부 신호로 사용합니다.
 
-## 테스트와 로컬 실행
+이 프로젝트는 vLLM 자체의 health mechanism을 대체하기 위한 것이 아닙니다.
 
-Python 3.12 권장(Linux/macOS). Docker나 GPU 없이 unittest로 실행할 수 있습니다.
+**프로세스는 살아 있지만 inference가 멈춘 상황에서도 복구가 필요한 운영 환경을 위한 추가적인 safety layer입니다.**
 
-```sh
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python -m unittest discover -v
-VLLM_MODEL=my-model VLLM_BASE_URL=http://localhost:8000 STATE_FILE=/tmp/watchdog-state.json .venv/bin/python -m watchdog.main
-```
+---
 
-HTTP client, Docker manager, 시계, alert, state store가 주입 가능하며 정책 테스트는 가상 시간으로 실행합니다. 정상, 단발/연속 timeout, health 단독 실패, 복구 성공/실패, 재시작 제한, 성공 후 카운터 초기화, 이력 복원과 손상, 저장 실패, daemon 장애, cooldown, 종료, webhook 장애를 검사합니다.
+# License
 
-SIGTERM/SIGINT는 대기를 즉시 깨우고 새 재시작을 막습니다. 진행 중인 I/O는 deadline까지 마무리한 뒤 상태 저장, client close, logging flush 후 종료합니다. Compose stop_grace_period는 가장 긴 요청 deadline과 alert 시간을 합친 값보다 넉넉하게 설정합니다(기본 90초).
+Apache License 2.0.
 
-## 로그와 alert
-
-stdout에 JSON logging을 출력합니다. 정상 probe는 DEBUG, 실패는 WARNING, 상태 전환/재시작/복구는 INFO 이상입니다. 재시작 로그에는 timestamp, reason, health/inference 실패 횟수, 마지막 inference 성공의 Unix timestamp와 저장된 재시작 횟수가 포함됩니다.
-
-Webhook 이벤트: RESTART_TRIGGERED, RECOVERY_SUCCESS, RECOVERY_FAILED, MAX_RESTART_EXCEEDED. Payload는 service, container, event, reason, restart_count, ISO timestamp입니다. 최초 준비 성공도 RECOVERY_SUCCESS입니다. Docker 호출 실패/복구 timeout/내부 오류로 FAILED가 된 경우도 RECOVERY_FAILED를 보냅니다. 전송 실패는 로그만 남기고 제어 루프는 계속됩니다. 전송은 best-effort이며 재전송 queue는 없습니다.
-
-Authorization header, API key, prompt, 응답 본문, exception 원문 및 webhook URL은 로그에 기록하지 않습니다. HTTP redirect와 환경 proxy/.netrc 자동 인증은 사용하지 않습니다. 응답 본문은 1 MiB로 제한합니다.
-
-## Docker socket 보안
-
-**Docker socket 접근은 사실상 호스트 관리자 수준의 권한입니다.** 컨테이너가 침해되면 다른 컨테이너 제어와 호스트 파일 접근이 가능할 수 있습니다. Non-root, cap_drop, read-only filesystem만으로 이 권한이 제한되지는 않습니다. 신뢰할 수 있는 코드/이미지만 실행하고 socket 노출 범위를 최소화하세요. 더 강한 분리가 필요하면 대상 컨테이너와 API 작업을 제한하는 별도 proxy/authorization 계층을 설계해야 합니다.
-
-## Known limitations와 자체 검토
-
-- 단일 대상, 단일 watchdog을 전제로 합니다. 같은 state file은 lock으로 보호하지만 서로 다른 state volume을 쓰는 복수 watchdog은 조정하지 못합니다.
-- 과부하/queue 지연/네트워크 장애/잘못된 인증·모델 설정도 실제 hang과 구분되지 않습니다. 운영 지연 분포에 맞춰 timeout/threshold/cooldown을 조정해야 합니다. 재시작은 진행 중 요청을 끊습니다.
-- requests의 socket timeout에 POSIX SIGALRM 전체 deadline을 추가합니다. DNS와 느린 body 전송도 제한하며 main thread에서만 실행해야 합니다. Windows/다른 SIGALRM 사용자와의 embedding은 지원하지 않습니다.
-- 실행 중 복구 시간은 monotonic clock, 영속 restart 이력은 wall clock을 사용합니다. 큰 시스템 시각 변경은 재기동 시 window/grace 계산을 바꿀 수 있습니다.
-- 상태 쓰기 실패는 fail-closed로 멈춥니다. 파일이 삭제되거나 영속 volume이 교체되면 이력을 복원할 수 없습니다. Disk hang 같은 OS 수준 장애에는 I/O deadline이 적용되지 않습니다.
-- Docker daemon 장애도 제한된 예산을 소비하고 복구 검증 후 FAILED로 갈 수 있습니다. Watchdog은 daemon/GPU reset/host reboot를 수행하지 않습니다.
-- HTTP/JSON malformed 응답은 실패 처리하고, 예상 밖 내부 예외는 FAILED로 전환합니다. HTTP body/exception 원문은 비밀정보 보호를 위해 남기지 않습니다.
-- Webhook 장애는 최대 ALERT_TIMEOUT만큼 iteration을 지연시킬 수 있으나 main loop를 중단하지 않습니다.
-- 매우 짧은 completion은 GPU 전체 기능/장시간 generation/전체 replica의 정상 여부를 보장하지 않습니다.
-- MAX_RESTARTS는 제한에 도달한 마지막 시도에 복구 기회를 줍니다. FAILED에서는 자동 probe/restart를 중단하고 프로세스는 살아서 운영자 조치를 기다립니다.
-- 상태 파일 손상이나 영속 저장 오류 알림은 프로세스 재기동 때 다시 발생할 수 있습니다. 알림 전달 자체는 보장하지 않습니다.
-
-## 향후 개선 (Phase 2, 현재 미구현)
-
-Prometheus running/waiting requests, generation/prompt tokens, KV cache를 독립 collector로 추가하고 관측 정보를 별도 인터페이스로 전달할 수 있습니다. 현재 Controller는 HTTP ProbeResult만으로 결정하므로 metric 수집 장애와 복구 정책은 결합되지 않습니다. Prometheus/Grafana, HAProxy drain, 다중 instance, GPU reset, host reboot는 후속 범위입니다.
+자세한 내용은 `LICENSE`를 참고하십시오.
