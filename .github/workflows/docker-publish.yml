@@ -110,10 +110,17 @@ jobs:
         env:
           IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
-          image="ghcr.io/pyg410/vllm-self-healer@$IMAGE_DIGEST"
-          docker pull --platform linux/amd64 "$image"
-          docker run --rm --platform linux/amd64 "$image" \
-            python -c 'import os; import watchdog.main; assert os.getuid() == 10001'
-          docker pull --platform linux/arm64 "$image"
-          docker run --rm --platform linux/arm64 "$image" \
-            python -c 'import os; import watchdog.main; assert os.getuid() == 10001'
+          set -euo pipefail
+          repository="ghcr.io/pyg410/vllm-self-healer"
+          index=$(docker buildx imagetools inspect --raw "$repository@$IMAGE_DIGEST")
+          # Classic Docker image stores cannot retain two architectures under
+          # the same index digest. Pull each platform's distinct manifest.
+          for arch in amd64 arm64; do
+            digest=$(jq -er --arg arch "$arch" \
+              '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' \
+              <<< "$index")
+            image="$repository@$digest"
+            docker pull --platform "linux/$arch" "$image"
+            docker run --rm --platform "linux/$arch" "$image" \
+              python -c 'import os; import watchdog.main; assert os.getuid() == 10001'
+          done
