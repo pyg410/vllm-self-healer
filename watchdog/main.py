@@ -4,7 +4,8 @@ import threading
 from .alert import Alert
 from .config import Config
 from .controller import Controller
-from .docker_manager import DockerManager
+from .recovery import create_recovery
+from .probe_server import ProbeServer, ProbeStatus
 from .health import HealthProbe
 from .http_client import HttpClient
 from .inference import InferenceProbe
@@ -26,10 +27,16 @@ def main():
     store = StateStore(config.state_file)
     http = HttpClient()
     controller = None
+    server = None
     try:
         store.acquire()
+        recovery = create_recovery(config)
+        status = ProbeStatus(recovery) if config.recovery_mode == "kubernetes" else None
         controller = Controller(config, HealthProbe(config, http), InferenceProbe(config, http),
-                                DockerManager(config), Alert(config, http), store, stopping=stop.is_set)
+                                recovery, Alert(config, http), store, stopping=stop.is_set, status=status)
+        if status is not None:
+            server = ProbeServer(config.watchdog_http_host, config.watchdog_http_port, status)
+            server.start()
         while not stop.is_set():
             controller.step()
             stop.wait(controller.delay())
@@ -43,6 +50,8 @@ def main():
                 controller.persist()
             except Exception:
                 log("state persistence failed on shutdown", logging.ERROR)
+        if server:
+            server.close()
         http.close()
         store.close()
         log("watchdog stopped")

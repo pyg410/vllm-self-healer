@@ -4,7 +4,7 @@
 
 **vLLM 프로세스는 살아 있지만 추론이 멈췄을 때, 이를 감지하고 컨테이너를 자동으로 재시작합니다.**
 
-vLLM Self-Healer는 vLLM 옆에서 실행하는 경량 외부 watchdog입니다. /health 확인과 실제 생성 요청을 함께 사용하여, HTTP 서버는 응답하지만 추론이 완료되지 않는 장애를 감지합니다.
+vLLM Self-Healer는 Docker 또는 Kubernetes 환경에서 제한된 자동 복구를 수행하는 경량 watchdog입니다. /health 확인과 실제 생성 요청을 함께 사용하여, HTTP 서버는 응답하지만 추론이 완료되지 않는 장애를 감지합니다.
 
 ```text
 /health: 200 OK + inference: timeout
@@ -27,7 +27,7 @@ vLLM Self-Healer는 vLLM 옆에서 실행하는 경량 외부 watchdog입니다.
 - **상태 보존:** watchdog 재기동 후에도 재시작 이력과 FAILED 유지
 - **운영 지원:** JSON 로그, 선택적 webhook, amd64·arm64 이미지
 
-## 빠른 시작
+## Docker / Compose 빠른 시작
 
 기존 vLLM service가 있는 Compose 프로젝트에 watchdog을 추가합니다. 아래 예시는 Linux와 접근 가능한 호스트 Docker socket을 전제로 합니다.
 
@@ -93,7 +93,53 @@ docker compose logs -f vllm-self-healer
 
 > Docker socket 접근은 호스트 Docker daemon을 제어할 수 있는 높은 권한입니다. 신뢰할 수 있는 코드와 이미지에만 부여하세요.
 
-운영에서는 게시된 버전 또는 image digest를 고정합니다. 이미 게시된 빌드 ghcr.io/pyg410/vllm-self-healer:sha-440c4334도 사용할 수 있습니다. 아래 v0.1.0은 릴리스 절차의 예시이며 해당 버전이 게시되었다는 의미가 아닙니다.
+운영에서는 게시된 버전 또는 image digest를 고정합니다. 이미 게시된 빌드 ghcr.io/pyg410/vllm-self-healer:sha-440c4334도 사용할 수 있습니다. Kubernetes 지원은 게시 workflow가 성공한 v0.1.0 이미지를 사용합니다.
+
+## Kubernetes
+
+RECOVERY_MODE=kubernetes로 설정하면 sidecar로 실행합니다. 공통 probe/controller 정책은 유지하고 Docker 대신 kubelet에 복구 신호를 보냅니다.
+
+```text
+Pod: vLLM ← /health + inference ← self-healer
+                                  ↓ /ready, /live
+                                kubelet → vLLM 재시작
+```
+
+예시는 Deployment, Service, 작은 시작 래퍼 ConfigMap을 포함합니다.
+
+```bash
+kubectl apply -f kubernetes/deployment.example.yaml
+kubectl logs -f deployment/vllm -c vllm-self-healer
+```
+
+적용 전에 모델, GPU 자원, 이미지 버전, 저장소를 확인하세요. v0.1.0부터 이 모드를 제공합니다. Sidecar에는 Docker socket, Kubernetes API 인증정보·SDK, Pod 삭제 RBAC이 필요하지 않습니다. ServiceAccount token mount도 비활성화합니다.
+
+**ReadinessProbe와 livenessProbe는 반드시 vLLM 컨테이너에 정의하고 sidecar의 숫자 포트 9090을 지정합니다.** 같은 Pod의 network를 공유합니다. Sidecar에 이 probe를 달면 잘못된 컨테이너를 재시작합니다. Service는 Pod readiness로 새 트래픽 대상을 제외하며 기존 연결까지 강제로 drain하지는 않습니다.
+
+| Endpoint | HTTP 200 | HTTP 503 |
+|---|---|---|
+| /ready | HEALTHY | SUSPECT, RESTARTING, RECOVERING, FAILED |
+| /live | 활성 재시작 요청 없음, FAILED 포함 | 새 vLLM 시작 ID를 기다리는 활성 요청 |
+
+HTTP server thread는 동기화된 상태를 읽으며 Controller 전환이나 복구 작업을 실행하지 않습니다. Kubernetes 모드에서만 서버를 시작합니다.
+
+### API 없이 실제 재시작 확인
+
+HTTP 연결 실패만으로는 기존 hang과 새 재시작을 구분할 수 없습니다. 예시의 짧은 Python 시작 래퍼가 공유 볼륨에 새 UUID를 atomic하게 기록한 뒤 vLLM을 exec합니다. Manifest를 수정할 때도 이 래퍼를 유지해야 합니다.
+
+Backend는 /live=503을 노출하기 **전에** 이전 UUID와 제한 시각을 저장합니다. RESTARTING이나 RECOVERING 전환만으로 요청을 해제하지 않습니다. 다른 정상 UUID로 새 실행을 확인할 때까지 신호를 유지합니다. HTTP reader는 Controller의 다음 회차 전이라도 새 UUID를 확인하면 이전 신호를 즉시 차단하여 새 프로세스를 다시 재시작하지 않게 합니다.
+
+이후 Controller는 RECOVERING에서 STARTUP_GRACE_PERIOD를 기다리고 두 probe의 성공을 확인합니다. UUID 변경만으로 ready가 되지는 않습니다. Sidecar가 재기동되어도 대기 중 요청과 제한 시각을 상태 파일에서 복원합니다. Backend 정보가 없는 기존 version 1 Docker 상태 파일도 읽습니다.
+
+재시작 요청 시 UUID가 없거나 잘못되었거나, KUBERNETES_RESTART_TIMEOUT(기본 120초) 안에 새 UUID가 나타나지 않으면 FAILED로 전환합니다. 제한 시각이 지나면 제어 루프가 아직 실패를 처리하지 않았더라도 /live는 200으로 돌아가 오래된 신호를 차단하고 /ready는 503을 유지합니다. 이 제한은 liveness 주기 + termination grace + 예상 컨테이너 재시작 지연보다 길게 설정합니다.
+
+### Probe 및 저장소 선택
+
+예시 startupProbe는 vLLM /health 대신 sidecar /live를 확인합니다. 모델 로딩 시간 제한을 공통 Controller가 관리하도록 하기 위해서입니다. 모델 health를 검사하는 startupProbe는 이 프로젝트의 예산과 무관하게 vLLM을 재시작할 수 있습니다.
+
+공유 시작 ID 볼륨은 컨테이너 재시작에도 유지됩니다. 예시 상태 볼륨은 emptyDir이므로 **같은 Pod 안의** sidecar·컨테이너 재시작에는 이력이 유지되지만 Pod 교체 시 사라집니다. Pod 교체에도 이력을 유지하려면 /data에 적절한 영속 저장소를 사용하고 workload마다 독립된 상태 저장소를 배정합니다. 여러 replica가 하나의 상태 파일을 공유하면 안 됩니다.
+
+프로세스 종료, startup probe 실패, sidecar·network 장애 시 kubelet은 독립적으로 재시작할 수 있습니다. 이 동작은 watchdog 예산 범위 밖입니다. 반복 신호 방지는 제공한 래퍼가 매 실행마다 새 ID를 기록한다는 전제가 있습니다. 래퍼 오류, sidecar 접근 불가, filesystem hang은 이 전제를 깨뜨릴 수 있습니다. 포트 9090은 인증 없는 상태 endpoint이므로 클러스터 network로 접근을 제한하세요. 다중 Pod 조정·Operator 지원은 향후 범위입니다.
 
 ## 장애 판단 기준
 
@@ -133,7 +179,7 @@ RECOVERING → timeout → 재시도 정책 → 재시작 또는 FAILED
 |---|---|
 | HEALTHY | 두 probe 성공 |
 | SUSPECT | Probe 실패 중이며, 임계치 도달 후 cooldown을 기다리는 경우도 포함 |
-| RESTARTING | 시도를 기록하고 Docker 재시작 요청 |
+| RESTARTING | 시도를 기록하고 복구 backend에 재시작 요청 |
 | RECOVERING | Startup grace 대기 또는 준비 상태 검증 |
 | FAILED | 자동 probe·재시작 중단, 운영자 조치 필요 |
 
@@ -155,7 +201,7 @@ Docker daemon 장애와 결과가 불확실한 API timeout도 시도 횟수에 �
 
 ## 복구 범위와 제한사항
 
-복구 수단은 Docker 컨테이너 하나의 재시작입니다. CUDA·NCCL·드라이버·하드웨어 버그의 원인을 진단하거나 수리하지 않습니다.
+복구 대상은 vLLM 컨테이너 하나입니다. Docker에서는 직접 재시작하고 Kubernetes에서는 kubelet liveness를 사용합니다. CUDA·NCCL·드라이버·하드웨어 버그의 원인을 진단하거나 수리하지 않습니다.
 
 - 재시작은 처리 중 요청을 끊습니다.
 - 네트워크 장애, 잘못된 인증·모델 이름, 과부하도 probe 실패가 됩니다. 실제 서비스 지연에 맞춰 timeout과 임계치를 조정하세요.
@@ -191,6 +237,14 @@ Docker daemon 장애와 결과가 불확실한 API timeout도 시도 횟수에 �
 | `ALERT_TIMEOUT`           |                         `5` | webhook request deadline                |
 | `STATE_FILE`              | `/data/watchdog_state.json` | persistent watchdog state               |
 | `LOG_LEVEL`               |                      `INFO` | logging level                           |
+| RECOVERY_MODE | docker | docker 또는 kubernetes |
+| WATCHDOG_HTTP_HOST | 0.0.0.0 | Kubernetes probe server 주소 |
+| WATCHDOG_HTTP_PORT | 9090 | Kubernetes probe server 포트 |
+| VLLM_START_ID_FILE | /run/vllm-watchdog/start-id | 공유 vLLM 시작 UUID 파일 |
+| KUBERNETES_RESTART_TIMEOUT | 120 | 새 시작 UUID 최대 대기 시간 |
+
+VLLM_CONTAINER_NAME 필수 및 Docker timeout 관계 검증은 Docker 모드에만 적용합니다. RECOVERY_MODE 기본값은 docker이며 기존 Compose에는 새 설정이 필요하지 않습니다.
+
 
 RECOVERY_TIMEOUT에는 startup grace가 포함되지 않습니다. MAX_RESTARTS는 rolling window와 미복구 연속 시도에 모두 적용합니다. Compose 전용 이미지·socket group 설정을 포함한 전체 예시는 [.env.example](.env.example)을 참고하세요.
 
@@ -280,7 +334,7 @@ Watchdog은 UID/GID 10001로 실행됩니다. Named volume은 /data 소유권을
 
 SHA는 앞 8자리를 사용합니다. 버전 태그 push는 latest를 바꾸지 않습니다. 게시는 기본 GITHUB_TOKEN과 contents: read, packages: write 권한을 사용하며 workflow용 별도 PAT는 필요하지 않습니다.
 
-아래 v0.1.0 명령은 예시입니다. 실제 릴리스가 필요할 때 workflow가 포함된 커밋에서 새 태그를 만들고 Actions 성공 후 이미지를 받습니다.
+아래 명령은 v0.1.0 릴리스를 게시합니다(한 번만 실행). 실제 릴리스가 필요할 때 workflow가 포함된 커밋에서 새 태그를 만들고 Actions 성공 후 이미지를 받습니다.
 
 ```bash
 git tag -a v0.1.0 -m "Release v0.1.0"

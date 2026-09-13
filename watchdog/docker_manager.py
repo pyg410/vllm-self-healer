@@ -1,8 +1,11 @@
 import docker
 from .http_client import deadline
+from .recovery import RecoveryBackend
+from .types import FailureReason
 
 
-class DockerManager:
+class DockerManager(RecoveryBackend):
+    error_reason = FailureReason.DOCKER_ERROR
     def __init__(self, config, factory=docker.from_env):
         self.config, self.factory = config, factory
 

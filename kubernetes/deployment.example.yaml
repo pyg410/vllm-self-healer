@@ -1,0 +1,152 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-start-wrapper
+data:
+  launch.py: |
+    import os
+    from pathlib import Path
+    import sys
+    import uuid
+
+    # Write before exec so the sidecar can distinguish every container launch.
+    target = Path("/run/vllm-watchdog/start-id")
+    temporary = target.with_suffix(".tmp")
+    with temporary.open("w") as handle:
+        handle.write(str(uuid.uuid4()))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
+    os.execvp(sys.argv[1], sys.argv[1:])
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: vllm
+          # Pin a GPU-compatible version/digest for production.
+          image: vllm/vllm-openai:latest
+          command: ["python3", "/watchdog-start/launch.py"]
+          args: ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct", "--host", "0.0.0.0"]
+          ports:
+            - name: inference
+              containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: wrapper
+              mountPath: /watchdog-start
+              readOnly: true
+            - name: generation
+              mountPath: /run/vllm-watchdog
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+            - name: shm
+              mountPath: /dev/shm
+          # Gate on sidecar availability, not model health. The controller owns
+          # model loading deadlines; /health startup probes would bypass its budget.
+          startupProbe:
+            httpGet:
+              path: /live
+              port: 9090
+            periodSeconds: 2
+            failureThreshold: 60
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9090
+            periodSeconds: 5
+            failureThreshold: 1
+            timeoutSeconds: 2
+          # These probes belong to vLLM, even though port 9090 is the sidecar.
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 9090
+            periodSeconds: 5
+            failureThreshold: 1
+            timeoutSeconds: 2
+            terminationGracePeriodSeconds: 30
+        - name: vllm-self-healer
+          image: ghcr.io/pyg410/vllm-self-healer:v0.1.0
+          env:
+            - name: RECOVERY_MODE
+              value: kubernetes
+            - name: VLLM_BASE_URL
+              value: http://127.0.0.1:8000
+            - name: VLLM_MODEL
+              value: Qwen/Qwen2.5-0.5B-Instruct
+            - name: STATE_FILE
+              value: /data/watchdog_state.json
+            - name: VLLM_START_ID_FILE
+              value: /run/vllm-watchdog/start-id
+            - name: KUBERNETES_RESTART_TIMEOUT
+              value: "120"
+          ports:
+            - name: watchdog
+              containerPort: 9090
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: watchdog-data
+              mountPath: /data
+            - name: generation
+              mountPath: /run/vllm-watchdog
+              readOnly: true
+      volumes:
+        - name: wrapper
+          configMap:
+            name: vllm-start-wrapper
+        - name: generation
+          emptyDir: {}
+        - name: watchdog-data
+          emptyDir: {}
+        - name: model-cache
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+spec:
+  selector:
+    app: vllm
+  ports:
+    - name: inference
+      port: 8000
+      targetPort: inference

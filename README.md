@@ -4,7 +4,7 @@
 
 **Detect stalled inference in a running vLLM instance and automatically restart its container.**
 
-vLLM Self-Healer is a lightweight external watchdog. It combines /health checks with real synthetic generation requests to detect cases where the HTTP server responds but inference no longer completes.
+vLLM Self-Healer is a lightweight watchdog for bounded recovery on Docker or Kubernetes. It combines /health checks with real synthetic generation requests to detect cases where the HTTP server responds but inference no longer completes.
 
 ```text
 /health: 200 OK + inference: timeout
@@ -13,7 +13,7 @@ vLLM Self-Healer is a lightweight external watchdog. It combines /health checks 
                  ↓
         restart policy evaluation
                  ↓
-     Docker restart → recovery probes
+     Container restart → recovery probes
 ```
 
 A single failure does not trigger a restart. Recovery attempts are bounded, and each restart is followed by actual inference verification. The watchdog itself does not need a GPU.
@@ -27,7 +27,7 @@ A single failure does not trigger a restart. Recovery attempts are bounded, and 
 - **Persistent state:** retain restart history and FAILED across watchdog restarts.
 - **Operations:** JSON logs, optional webhooks, and amd64/arm64 images.
 
-## Quick start
+## Docker / Compose quick start
 
 Add the watchdog to the Compose project containing your existing vLLM service. The example assumes Linux and an accessible host Docker socket.
 
@@ -93,7 +93,53 @@ On a fresh watchdog startup and after a vLLM restart, the default startup grace 
 
 > Docker socket access grants extensive control over the host Docker daemon. Give it only to trusted code and images.
 
-For production, select a published version or pin an image digest. A previously published build is also available as ghcr.io/pyg410/vllm-self-healer:sha-440c4334. The v0.1.0 tag below is a release example, not a claim that this version has been published.
+For production, select a published version or pin an image digest. A previously published build is also available as ghcr.io/pyg410/vllm-self-healer:sha-440c4334. Use v0.1.0 after its publishing workflow succeeds for Kubernetes support.
+
+## Kubernetes
+
+Set RECOVERY_MODE=kubernetes to run the watchdog as a sidecar. The shared probe/controller policy is unchanged; recovery signals go to kubelet instead of Docker.
+
+```text
+Pod: vLLM ← /health + inference ← self-healer
+                                  ↓ /ready, /live
+                                kubelet → restart vLLM
+```
+
+The example includes a Deployment, Service and a small startup-wrapper ConfigMap:
+
+```bash
+kubectl apply -f kubernetes/deployment.example.yaml
+kubectl logs -f deployment/vllm -c vllm-self-healer
+```
+
+Review the model, GPU resources, image versions and storage before applying. v0.1.0 is the first image with this mode. The sidecar requires neither a Docker socket nor Kubernetes API credentials, SDK or Pod-delete RBAC. ServiceAccount token mounting is disabled.
+
+**Define readinessProbe and livenessProbe on the vLLM container, pointing to the sidecar's numeric port 9090.** Containers share the Pod network. Attaching these probes to the sidecar would restart the wrong container. A Service uses Pod readiness to exclude it from new traffic; existing connections are not forcibly drained.
+
+| Endpoint | HTTP 200 | HTTP 503 |
+|---|---|---|
+| /ready | HEALTHY | SUSPECT, RESTARTING, RECOVERING, FAILED |
+| /live | No active restart request, including FAILED | Active request awaiting a new vLLM start ID |
+
+An HTTP server thread reads synchronized status; it does not execute controller transitions or recovery actions. Only Kubernetes mode starts this server.
+
+### Confirming restart without an API
+
+HTTP unavailability alone cannot distinguish an existing hang from a new restart. The example wraps vLLM startup with a short Python script which writes a fresh UUID atomically to a shared volume and then execs vLLM. Keep this wrapper when adapting the manifest.
+
+The backend records the old UUID and deadline **before** exposing /live=503. Entering RESTARTING or RECOVERING does not automatically clear the request. The signal remains until a different valid UUID proves a new launch. The HTTP reader immediately suppresses the old signal for that new UUID, even before the controller's next iteration, preventing it from restarting the new process again.
+
+The controller then enters RECOVERING, waits STARTUP_GRACE_PERIOD and requires both probes to succeed. A new UUID alone never marks the workload ready. Pending requests and their deadlines survive sidecar restarts through the state file. Legacy version 1 Docker state files without backend data are accepted.
+
+If the UUID is missing/invalid when requesting restart, or no new UUID appears within KUBERNETES_RESTART_TIMEOUT (default 120 seconds), the controller enters FAILED. At the deadline /live returns 200 even if the control loop has not yet processed the failure, stopping a stale signal; /ready remains 503. Set this timeout above the liveness period plus termination grace and expected container restart delay.
+
+### Probe and storage choices
+
+The example startupProbe checks the sidecar /live endpoint, not vLLM /health. This enables the shared controller to own model-loading deadlines. A model-health startupProbe can restart vLLM independently of this project's budget.
+
+The shared start-ID volume survives container restarts. The example state volume is emptyDir: history survives sidecar/container restarts **within the same Pod**, but disappears when the Pod is replaced. Use suitable persistent storage for /data if history must survive Pod replacement, and use distinct state storage for each workload. Do not share one state file across replicas.
+
+Kubelet can still restart containers independently after process exits, startup probe failures or sidecar/network outages. These native actions are outside the watchdog's budget. The no-repeat signaling guarantee assumes the provided wrapper writes a new ID on every launch. A broken wrapper, inaccessible sidecar, or hung filesystem can defeat that assumption. Protect port 9090 with appropriate cluster networking; it exposes status without authentication. Multi-Pod coordination/Operator support remains future work.
 
 ## Failure detection
 
@@ -133,7 +179,7 @@ RECOVERING → timeout → retry policy → restart or FAILED
 |---|---|
 | HEALTHY | Both probes succeeded |
 | SUSPECT | Probe failures; may also be waiting for cooldown after reaching the threshold |
-| RESTARTING | Attempt recorded; Docker restart requested |
+| RESTARTING | Attempt recorded; Recovery backend restart requested |
 | RECOVERING | Waiting for startup grace or verifying readiness |
 | FAILED | Automatic probes/restarts stopped; operator action required |
 
@@ -155,7 +201,7 @@ The loop is synchronous: each normal iteration takes health request time + infer
 
 ## Recovery scope and limitations
 
-Recovery means restarting one Docker container. The watchdog does not diagnose or repair CUDA, NCCL, driver, or hardware bugs.
+Recovery targets one vLLM container: directly through Docker or through kubelet liveness in Kubernetes. The watchdog does not diagnose or repair CUDA, NCCL, driver, or hardware bugs.
 
 - Restarting interrupts in-flight requests.
 - Network outages, incorrect credentials/model names, and overload can all cause probe failures. Tune deadlines and thresholds to real service latency.
@@ -191,6 +237,14 @@ All settings use environment variables. Durations are in seconds. Positive value
 | `ALERT_TIMEOUT`           |                         `5` | Webhook request deadline                    |
 | `STATE_FILE`              | `/data/watchdog_state.json` | Persistent watchdog state                   |
 | `LOG_LEVEL`               |                      `INFO` | Logging level                               |
+| RECOVERY_MODE | docker | docker or kubernetes |
+| WATCHDOG_HTTP_HOST | 0.0.0.0 | Kubernetes probe server bind address |
+| WATCHDOG_HTTP_PORT | 9090 | Kubernetes probe server port |
+| VLLM_START_ID_FILE | /run/vllm-watchdog/start-id | Shared vLLM launch UUID |
+| KUBERNETES_RESTART_TIMEOUT | 120 | Maximum wait for a new launch UUID |
+
+VLLM_CONTAINER_NAME and the Docker timeout relationship are required only in Docker mode. RECOVERY_MODE defaults to docker; existing Compose deployments need no new settings.
+
 
 RECOVERY_TIMEOUT excludes startup grace. MAX_RESTARTS applies to both the rolling window and consecutive attempts without recovery. See [.env.example](.env.example) for the complete environment example, including Compose-only image and socket group settings.
 
@@ -280,7 +334,7 @@ The watchdog runs as UID/GID 10001. Named volumes use /data ownership; bind moun
 
 SHA tags use eight characters. Version-tag pushes do not update latest. Publishing uses the built-in GITHUB_TOKEN with contents: read and packages: write; no separate PAT is needed by the workflow.
 
-The following v0.1.0 commands are examples. Create a new release only when intended, on a commit containing the workflow, and wait for Actions to succeed before pulling it:
+The following commands publish the v0.1.0 release (run once). Create a new release only when intended, on a commit containing the workflow, and wait for Actions to succeed before pulling it:
 
 ```bash
 git tag -a v0.1.0 -m "Release v0.1.0"

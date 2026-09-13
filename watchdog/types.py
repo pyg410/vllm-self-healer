@@ -23,6 +23,7 @@ class FailureReason(str, Enum):
     ALIVE_BUT_STALLED = "ALIVE_BUT_STALLED"
     RECOVERY_TIMEOUT = "recovery_timeout"
     DOCKER_ERROR = "docker_error"
+    RECOVERY_ERROR = "recovery_error"
     STATE_ERROR = "state_error"
     INTERNAL_ERROR = "internal_error"
 
