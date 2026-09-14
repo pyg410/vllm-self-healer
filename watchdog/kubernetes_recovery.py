@@ -37,6 +37,14 @@ class KubernetesRecovery(RecoveryBackend):
                 "deadline": self.wall() + self.config.kubernetes_restart_timeout,
             }
 
+    def finalize_request(self):
+        with self.lock:
+            if self.request is None:
+                raise RuntimeError("Missing prepared restart")
+            # Keep the generation captured before the PRE hook. A replacement
+            # during a slow hook must not receive the old restart signal.
+            self.request["deadline"] = self.wall() + self.config.kubernetes_restart_timeout
+
     def restart(self):
         with self.lock:
             self.armed = True

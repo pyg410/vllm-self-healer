@@ -26,10 +26,12 @@ class FailureReason(str, Enum):
     RECOVERY_ERROR = "recovery_error"
     STATE_ERROR = "state_error"
     INTERNAL_ERROR = "internal_error"
+    HOOK_FAILURE = "hook_failure"
 
 
 class AlertEvent(str, Enum):
     RESTART_TRIGGERED = "RESTART_TRIGGERED"
+    RESTART_CONFIRMED = "RESTART_CONFIRMED"
     RECOVERY_SUCCESS = "RECOVERY_SUCCESS"
     RECOVERY_FAILED = "RECOVERY_FAILED"
     MAX_RESTART_EXCEEDED = "MAX_RESTART_EXCEEDED"

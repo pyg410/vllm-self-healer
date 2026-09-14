@@ -1,6 +1,7 @@
 import logging
 import time
-from .logging_config import log
+from .logging_config import log, log_error
+from .hooks import NoopHooks
 from .state import RestartPolicy, StateError
 from .recovery import RecoveryBackend, ImmediateRecovery
 from .types import AlertEvent as E, FailureReason as R, WatchdogState as S
@@ -8,11 +9,13 @@ from .types import AlertEvent as E, FailureReason as R, WatchdogState as S
 
 class Controller:
     def __init__(self, config, health, inference, recovery, alert, store,
-                 clock=time.monotonic, wall_clock=time.time, stopping=lambda: False, status=None):
+                 clock=time.monotonic, wall_clock=time.time, stopping=lambda: False, status=None, hooks=None, events=None):
         self.c, self.health, self.inference = config, health, inference
         self.recovery = recovery if isinstance(recovery, RecoveryBackend) else ImmediateRecovery(recovery)
         self.alert, self.store, self.status = alert, store, status
         self.clock, self.wall, self.stopping = clock, wall_clock, stopping
+        self.hooks = hooks if hooks is not None else NoopHooks()
+        self.events = events
         self.state = S.RECOVERING
         self.health_failures = self.inference_failures = 0
         self.last_successful_inference = None
@@ -39,12 +42,19 @@ class Controller:
                 elif old_state == S.RECOVERING:
                     self.ready = self.clock() + max(0, saved["recovery_ready_at"] - self.wall())
                     self.expires = self.clock() + max(0, saved["recovery_deadline"] - self.wall())
+                log("persisted state restored", state=old_state.value,
+                    backend=config.recovery_mode, effective_state=self.state.value,
+                    recovery_ready_at=saved["recovery_ready_at"],
+                    recovery_deadline=saved["recovery_deadline"],
+                    restart_history_count=len(self.policy.history),
+                    stored_recovery_timing_applied=old_state == S.RECOVERING)
                 # RESTARTING means an ambiguous/interrupted Docker operation;
                 # verify recovery first and retain its already reserved attempt.
             if self.state == S.FAILED:
                 self.recovery.cancel()
             self.persist()
-        except StateError:
+        except StateError as error:
+            log_error("state restore failed", error, "state_restore")
             self.persistence_broken = True
             self.fail(R.STATE_ERROR, E.RECOVERY_FAILED)
         self.publish()
@@ -52,12 +62,19 @@ class Controller:
         if self.state == S.RECOVERING:
             log("recovery started", state=self.state.value, initial=True)
 
+    def emit(self, event, reason):
+        # Keep legacy ALERT_WEBHOOK_URL payloads and its original event set.
+        if event != E.RESTART_CONFIRMED:
+            self.alert.send(event, reason, len(self.policy.history))
+        if self.events is not None:
+            self.events.send(event, reason, len(self.policy.history))
+
     def persist(self):
         if self.persistence_broken:
             return
         self.store.save({
             "version": 1, "state": self.state.value,
-            "backend": self.recovery.snapshot(),
+            "backend": {} if self.state == S.SUSPECT else self.recovery.snapshot(),
             "restart_history": list(self.policy.history),
             "recovery_attempts": self.recovery_attempts,
             "last_successful_inference": self.last_successful_inference,
@@ -84,7 +101,7 @@ class Controller:
         except StateError:
             self.persistence_broken = True
             log("state persistence failed", logging.ERROR)
-        self.alert.send(event, reason.value, len(self.policy.history))
+        self.emit(event, reason.value)
 
     def probes(self, recovery=False):
         remaining = lambda maximum: min(maximum, max(0.001, self.expires - self.clock())) if recovery else maximum
@@ -120,13 +137,15 @@ class Controller:
         if self.policy.cooling_down(now):
             log("restart cooldown active", logging.DEBUG, state=self.state.value)
             return
-        self.transition(S.RESTARTING)
+        # Reserve in SUSPECT before running external actions. A crash during a
+        # PRE hook must not restore an armed Kubernetes request without approval.
+        self.transition(S.SUSPECT)
         self.policy.history.append(now)
         self.recovery_attempts += 1
         # Reserve before side effect, including ambiguous timeout/daemon failures.
         try:
-            self.recovery.prepare()
             self.persist()
+            self.recovery.prepare()
         except StateError:
             self.persistence_broken = True
             self.fail(R.STATE_ERROR, E.RECOVERY_FAILED)
@@ -138,7 +157,24 @@ class Controller:
             health_failure_count=self.health_failures, inference_failure_count=self.inference_failures,
             last_successful_inference=self.last_successful_inference,
             restart_count=len(self.policy.history))
-        self.alert.send(E.RESTART_TRIGGERED, reason.value, len(self.policy.history))
+        self.emit(E.RESTART_TRIGGERED, reason.value)
+        if self.stopping():
+            return
+        if not self.hooks.pre_restart(reason.value, len(self.policy.history)):
+            self.fail(R.HOOK_FAILURE, E.RECOVERY_FAILED)
+            return
+        if self.stopping():
+            return
+        try:
+            # Start the Kubernetes confirmation timeout after hooks finish.
+            self.recovery.finalize_request()
+            self.transition(S.RESTARTING)
+            self.persist()
+        except StateError:
+            raise
+        except Exception:
+            self.fail(self.recovery.error_reason, E.RECOVERY_FAILED)
+            return
         if self.stopping():
             return
         try:
@@ -151,7 +187,9 @@ class Controller:
         except Exception:
             event = "docker restart failed" if self.recovery.error_reason == R.DOCKER_ERROR else "recovery request failed"
             log(event, logging.ERROR, reason=self.recovery.error_reason.value)
-            self.alert.send(E.RECOVERY_FAILED, self.recovery.error_reason.value, len(self.policy.history))
+            self.emit(E.RECOVERY_FAILED, self.recovery.error_reason.value)
+        else:
+            self.emit(E.RESTART_CONFIRMED, "backend_restart_completed")
         # A timed-out Docker call may have succeeded server-side. Always verify.
         self.begin_recovery()
 
@@ -174,6 +212,7 @@ class Controller:
                     self.fail(self.recovery.error_reason, E.RECOVERY_FAILED)
                     return
                 if completed:
+                    self.emit(E.RESTART_CONFIRMED, "backend_restart_completed")
                     self.begin_recovery()
             elif self.state == S.RECOVERING:
                 self.recover()
@@ -201,16 +240,21 @@ class Controller:
             if self.stopping():
                 return
             if result and result[0] and self.clock() < self.expires:
+                if not self.hooks.post_recovery("probes_successful", len(self.policy.history)):
+                    self.fail(R.HOOK_FAILURE, E.RECOVERY_FAILED)
+                    return
+                if self.stopping():
+                    return
                 self.transition(S.HEALTHY)
                 self.recovery_attempts = 0
                 self.health_failures = self.inference_failures = 0
                 self.persist()
                 log("recovery successful", state=self.state.value)
-                self.alert.send(E.RECOVERY_SUCCESS, "probes_successful", len(self.policy.history))
+                self.emit(E.RECOVERY_SUCCESS, "probes_successful")
                 return
         if self.clock() >= self.expires:
             log("recovery failed", logging.ERROR, reason=R.RECOVERY_TIMEOUT.value)
-            self.alert.send(E.RECOVERY_FAILED, R.RECOVERY_TIMEOUT.value, len(self.policy.history))
+            self.emit(E.RECOVERY_FAILED, R.RECOVERY_TIMEOUT.value)
             # Move to SUSPECT so cooldown does not repeat recovery alerts.
             self.transition(S.SUSPECT)
             self.health_failures = self.inference_failures = self.c.failure_threshold

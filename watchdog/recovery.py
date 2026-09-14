@@ -8,6 +8,9 @@ class RecoveryBackend:
     def prepare(self):
         """Reserve backend state before the controller persists its attempt."""
 
+    def finalize_request(self):
+        """Finalize confirmation timing after lifecycle hooks, before persistence."""
+
     def restart(self):
         """Return False when asynchronous restart confirmation is required."""
         raise NotImplementedError
