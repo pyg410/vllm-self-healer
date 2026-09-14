@@ -1,4 +1,4 @@
-# 운영 가이드 (v0.1.1)
+# 운영 가이드 (v0.2.0)
 
 [English](operations.md) | [README](../README.ko.md)
 
@@ -16,17 +16,17 @@ Watchdog 설정으로 보이는 미지원 이름은 WARNING을 남기고 계속 
 
 환경변수는 **프로세스 시작 시 한 번** 읽습니다. .env를 수정해도 실행 중 프로세스는 변경되지 않으며 새 환경으로 재생성·재시작해야 합니다.
 
-| 설정 | 사용 시점 | v0.1.1 기본 의미 |
+| 설정 | 사용 시점 | v0.2.0 기본 의미 |
 |---|---|---|
 | CHECK_INTERVAL | 정상 감시 회차 사이 | Probe 완료 후 30초 대기 |
-| STARTUP_GRACE_PERIOD | 새 복구 회차 시작 | Probe 없이 300초 대기 |
+| STARTUP_GRACE_PERIOD | 새 복구 회차 시작 | 즉시 probe, 300초 동안 재시작 억제 |
 | RECOVERY_TIMEOUT | 새 복구 회차 시작 | Grace 이후 검증에 600초 허용 |
 | RESTART_COOLDOWN | 재시작 정책 평가 | 시도 시작 시각 사이 최소 300초 |
 | RESTART_WINDOW | 재시작 예산 평가 | 최근 600초의 시도 집계 |
 | EVENT_WEBHOOK_* | 이벤트 전송 | 프로세스 시작 시 읽은 설정 사용 |
 | PRE/POST hook 설정 | 해당 lifecycle action | 프로세스 시작 시 읽은 설정 사용 |
 
-RECOVERING 복원 시 저장된 recovery_ready_at과 recovery_deadline이 새 grace/timeout 환경변수보다 우선합니다. 새 값은 다음 복구 회차 또는 의도적인 상태 초기화 이후 적용됩니다. v0.1.1에서는 grace 도중 조기 probe를 하지 않습니다. FAILURE_THRESHOLD는 HEALTHY/SUSPECT용이며 RECOVERING은 복구 deadline으로 판단하므로 카운터가 임계치를 넘을 수 있습니다.
+RECOVERING 복원 시 저장된 recovery_ready_at과 recovery_deadline이 새 grace/timeout 환경변수보다 우선합니다. 새 값은 다음 복구 회차 또는 의도적인 상태 초기화 이후 적용됩니다. v0.2.0에서는 grace 도중 probe가 성공하면 조기 복구할 수 있습니다. 저장된 recovery_ready_at은 첫 검사 허용 시각이 아닌 유예 종료 시각입니다. FAILURE_THRESHOLD는 HEALTHY/SUSPECT용이며 RECOVERING은 복구 deadline으로 판단하므로 카운터가 임계치를 넘을 수 있습니다.
 
 ## 로그: 두 방식 중 선택
 
@@ -166,4 +166,52 @@ Kubernetes emptyDir은 컨테이너·sidecar 재시작에는 유지되지만 Pod
 
 ## 후속 범위
 
-v0.2.0은 별도 작업입니다. Startup grace 중 probe, recovery/FAILED reason 저장, timezone 설정, Docker 진단, Docker 의존성 선택 설치는 이번에 구현하지 않습니다. Kubernetes API나 다중 Pod controller도 추가하지 않습니다.
+Kubernetes API 접근과 다중 Pod controller는 지원 범위에 포함하지 않습니다.
+
+## v0.2.0 전환과 진단
+
+### 조기 준비 완료
+
+최초 시작과 재시작 후 복구 모두 즉시 probe를 실행하고 회차 사이 RECOVERY_CHECK_INTERVAL을 기다립니다. 같은 회차에 health와 inference가 모두 성공하고 POST_RECOVERY 정책을 통과해야 HEALTHY 및 readiness 200이 됩니다. Kubernetes는 반드시 start-ID 변경을 확인한 뒤 재시작 후 복구로 진입합니다. HTTP 성공만으로 재시작 확인을 건너뛰지 않습니다.
+
+Grace는 자동 재시작을 막는 기간이며 조기 HEALTHY 전환 후에도 유지됩니다. 유예 중 probe 실패는 시도 예산을 소비하지 않습니다. RECOVERING에서 계속 실패하면 grace + RECOVERY_TIMEOUT 전체 제한(기본 900초)까지 기다립니다. 이미 조기 복구에 성공한 뒤 다시 실패하면 일반 임계치와 cooldown을 적용하되 원래 grace 종료 전 재시작은 억제합니다. 느린 probe도 전체 복구 제한의 남은 시간 안에 끝나도록 제한합니다.
+
+기존 version 1 상태는 이력 삭제나 마이그레이션 없이 읽고, 새 필드는 같은 버전의 선택적 필드로 저장합니다. RECOVERING 복원 시 새 환경변수와 달라도 저장된 유예 종료 및 deadline을 유지하지만 조기 검사는 가능해집니다. 이미 만료된 deadline은 연장하지 않습니다. HEALTHY/SUSPECT 복원 또는 중단된 Docker 재시작은 기존처럼 현재 설정으로 새 검증 회차를 시작합니다. 업그레이드만을 위해 상태를 초기화할 필요는 없습니다.
+
+### 복구와 최종 실패 이유
+
+`recovery_reason`은 최근 복구 진입 맥락입니다. `startup`은 저장 상태 없는 시작, `post_restart`는 backend 작업 완료 또는 결과가 불확실한 Docker 시도 후 검증, `restored_recovery`는 저장 상태를 읽은 watchdog 시작입니다. Kubernetes RESTARTING 복원은 확인 대기를 유지하고 UUID 변경 확인 후 post_restart가 됩니다. 로그·상태·generic event webhook에 추가하며 legacy alert payload는 유지합니다. `failed_reason`은 FAILED 밖에서는 null이고, 일시적 probe 오류가 아닌 자동 복구를 최종 중단한 이유입니다.
+
+| failed_reason | 의미 |
+|---|---|
+| unknown | 원인이 없는 구버전 FAILED 상태 |
+| restart_budget_exhausted | Rolling 또는 연속 재시도 예산 초과 |
+| restart_confirmation_timeout | Kubernetes 제한 시간 안에 새 UUID 미확인 |
+| invalid_start_id | 재시작 준비 시 유효한 UUID를 읽지 못함 |
+| backend_failure | Backend 준비·요청 확정·확인 실패 |
+| hook_failure | PRE/POST abort 정책으로 진행 중단 |
+| state_error | 상태 읽기·저장 오류 |
+| internal_error | 예기치 않은 제어 루프 오류 |
+| recovery_timeout | 복구 timeout을 최종 실패로 처리한 경우의 코드; 일반 timeout은 먼저 제한된 재시도 정책 적용 |
+
+복구 timeout 이후 예산까지 소진하면 최종 원인은 restart_budget_exhausted입니다. Docker API 오류는 원격에서 이미 재시작되었을 수 있어 기존처럼 검증으로 넘어갑니다. FAILED 원인은 재기동 후에도 유지되고 복원 로그에 표시합니다. 저장장치 자체가 고장 나면 로그는 남기지만 영속 저장을 보장할 수 없습니다. 알 수 없는 원인 값은 잘못된 상태로 처리합니다. 자동 초기화는 추가하지 않습니다.
+
+### 로그 시간대
+
+`LOG_TIMEZONE=Asia/Seoul` 또는 America/New_York 같은 IANA 이름을 설정합니다. 기본값은 UTC입니다. 잘못된 시간대는 값을 출력하지 않고 `Invalid LOG_TIMEZONE` 시작 오류로 처리합니다. Stdout과 회전 파일에 동일한 offset 포함 시각을 사용합니다. Event/hook 시각은 UTC, 상태의 시간은 Unix seconds를 유지합니다. 시스템 시간대 DB가 없는 환경을 위해 core requirements에 tzdata를 포함합니다.
+
+### Docker 시작 진단
+
+Docker 모드는 감시 시작 전 한 번 읽기 전용 진단을 실행합니다. Docker SDK 환경 설정으로 연결하고 daemon ping과 대상 컨테이너 조회를 수행합니다. Unix transport에서는 실제 연결로 소켓 접근도 확인하며, remote/TLS transport도 지원하므로 특정 로컬 소켓 경로를 가정하지 않습니다. 실패 시 고정 단계와 예외 유형만 출력하고 경로·URL·원문 오류는 숨깁니다. 전체 진단은 DOCKER_API_TIMEOUT으로 제한됩니다. 소켓 없음·권한 부족·daemon 장애·대상 없음은 경고 후 감시를 계속합니다. 진단으로 컨테이너를 생성·정지·재시작하지 않습니다. 이후 복구는 기존 예산을 따르며 Kubernetes 모드는 Docker에 연결하지 않습니다.
+
+### Docker 선택 의존성
+
+기본 requirements와 배포 이미지는 Docker 지원을 유지합니다. Kubernetes 전용 환경에서는:
+
+```bash
+python -m pip install -r requirements-core.txt
+# Docker SDK 없는 비루트 이미지:
+docker build --build-arg REQUIREMENTS_FILE=requirements-core.txt -t vllm-self-healer:kubernetes .
+```
+
+RECOVERY_MODE=kubernetes 및 기존 필수 start-ID wrapper를 사용합니다. Core 전용 설치에서는 Docker 복구가 불가능하며, Docker로 전환하려면 requirements.txt 또는 기본 이미지를 사용해야 합니다. Registry workflow는 기본 이미지만 배포하고 Kubernetes 전용 태그는 발행하지 않습니다. Extras만을 위한 새 Python 배포 패키지는 도입하지 않았습니다.

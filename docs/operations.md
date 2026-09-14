@@ -1,4 +1,4 @@
-# Operational guide (v0.1.1)
+# Operational guide (v0.2.0)
 
 [한국어](operations.ko.md) | [README](../README.md)
 
@@ -16,17 +16,17 @@ Startup failures identify error_type, a fixed stage (logging_setup, state_direct
 
 Environment variables are read **once per process startup**. Editing .env does not update a running process; recreate/restart it with the new environment.
 
-| Setting | Used when | Default meaning in v0.1.1 |
+| Setting | Used when | Default meaning in v0.2.0 |
 |---|---|---|
 | CHECK_INTERVAL | Between normal monitoring iterations | Wait 30 seconds after probes complete |
-| STARTUP_GRACE_PERIOD | A new recovery cycle begins | Wait 300 seconds without probing |
+| STARTUP_GRACE_PERIOD | A new recovery cycle begins | Suppress restart for 300 seconds; probe immediately |
 | RECOVERY_TIMEOUT | A new recovery cycle begins | Allow 600 seconds of verification after grace |
 | RESTART_COOLDOWN | Restart policy evaluation | At least 300 seconds between attempt start times |
 | RESTART_WINDOW | Restart budget evaluation | Count attempts within the last 600 seconds |
 | EVENT_WEBHOOK_* | Event dispatch | Use settings loaded at process startup |
 | PRE/POST hook settings | Corresponding lifecycle action | Use settings loaded at process startup |
 
-When RECOVERING is restored, saved recovery_ready_at and recovery_deadline take precedence over new grace/timeout values for that cycle. New values apply to subsequent cycles, or after intentional state reset. There is no early probing during grace in v0.1.1. FAILURE_THRESHOLD governs HEALTHY/SUSPECT, not RECOVERING: counters can exceed it while the recovery deadline is still running.
+When RECOVERING is restored, saved recovery_ready_at and recovery_deadline take precedence over new grace/timeout values for that cycle. New values apply to subsequent cycles, or after intentional state reset. In v0.2.0, probes run during grace and can complete recovery early; the saved recovery_ready_at is the grace boundary, not the first allowed probe time. FAILURE_THRESHOLD governs HEALTHY/SUSPECT, not RECOVERING: counters can exceed it while the recovery deadline is still running.
 
 ## Logging: choose an option
 
@@ -166,4 +166,52 @@ Kubernetes emptyDir survives container/sidecar restarts but not Pod replacement.
 
 ## Deferred work
 
-v0.2.0 work remains separate: probing during startup grace, explicit recovery/FAILED reason persistence, timezone configuration, Docker diagnostics and optional Docker dependency packaging. No Kubernetes API access or multi-Pod controller is introduced here.
+Kubernetes API access and multi-Pod controller behavior remain outside the supported scope.
+
+## v0.2.0 migration and diagnostics
+
+### Early readiness
+
+Both fresh startup and post-restart recovery probe immediately, then wait RECOVERY_CHECK_INTERVAL between iterations. Health and inference must succeed together and POST_RECOVERY must permit completion before HEALTHY or readiness 200. Kubernetes still waits for a changed start-ID before entering post-restart recovery; a healthy HTTP endpoint cannot bypass restart confirmation.
+
+Grace is restart protection, including after an early HEALTHY transition. Probe failures during grace do not consume attempts. While RECOVERING, failures wait for the full grace + RECOVERY_TIMEOUT deadline (900 seconds by default). If early recovery has already succeeded, subsequent failures use the normal threshold and cooldown, with restart still suppressed until the original grace boundary. Slow probes are bounded by the remaining overall deadline.
+
+Upgrade accepts version 1 state files without migration or clearing restart history. New optional fields are written using the same version. A restored RECOVERING cycle retains its saved grace boundary and deadline, even if new environment values differ, but may now probe early. An already expired deadline is not extended. A restored HEALTHY/SUSPECT or interrupted Docker restart starts a fresh verification cycle with configured timing, as before. Do not reset state just to upgrade.
+
+### Recovery and failure reasons
+
+`recovery_reason` identifies the most recent recovery entry: `startup` (no saved state), `post_restart` (backend operation completed or an ambiguous Docker attempt moved to verification), or `restored_recovery` (verification resumed after watchdog startup with saved state). Restored Kubernetes RESTARTING remains pending; once confirmed, its reason becomes post_restart. Logs, persisted state and generic event webhook metadata expose this context; legacy alert payloads stay unchanged. `failed_reason` is null outside FAILED and describes the terminal stop, not every transient probe error.
+
+| failed_reason | Meaning |
+|---|---|
+| unknown | Legacy FAILED state has no recorded reason |
+| restart_budget_exhausted | Rolling or consecutive attempt budget reached |
+| restart_confirmation_timeout | No replacement UUID by the Kubernetes deadline |
+| invalid_start_id | Cannot read a valid UUID when preparing a restart |
+| backend_failure | Backend preparation, request finalization or confirmation failed |
+| hook_failure | PRE/POST abort policy blocked progress |
+| state_error | State restore or persistence failed |
+| internal_error | Unexpected control-loop error |
+| recovery_timeout | Recovery timeout used as a terminal failure reason; normal timeout first enters bounded retry policy |
+
+A timeout followed by exhausted attempts records restart_budget_exhausted as the final reason. Docker API errors still enter verification because the restart might have succeeded remotely. FAILED reasons survive restart and are emitted in restore logs. If storage itself is broken, the process logs the reason but cannot guarantee persistence. Unknown supplied reason values are rejected as invalid state. No automatic reset is added.
+
+### Log timezone
+
+Set `LOG_TIMEZONE=Asia/Seoul` (or another IANA name such as America/New_York). Default UTC remains unchanged. Invalid zones fail startup with `Invalid LOG_TIMEZONE`, without echoing the value. Stdout and rotating files use the same offset-aware timestamp. Event and hook timestamps remain UTC; state timestamps remain Unix seconds. The core requirements include tzdata for environments without a system timezone database.
+
+### Docker startup checks
+
+Docker mode performs one read-only diagnostic before monitoring: connect using the Docker SDK's environment settings, ping the daemon and look up the configured target. Successful connection also establishes socket accessibility for Unix transports; remote/TLS transports are supported without assuming a local socket. Failures report a fixed stage and exception class, never socket paths, URLs or raw messages. The entire diagnostic is bounded by DOCKER_API_TIMEOUT. A missing socket, denied permission, daemon outage or absent target produces a warning and monitoring continues; no container is created, stopped or restarted by diagnostics. Later recovery still follows existing budgets. Kubernetes mode makes no Docker connection.
+
+### Optional Docker dependency
+
+The default requirements and published image retain Docker support. For a Kubernetes-only environment:
+
+```bash
+python -m pip install -r requirements-core.txt
+# Or build a non-root image without the Docker SDK:
+docker build --build-arg REQUIREMENTS_FILE=requirements-core.txt -t vllm-self-healer:kubernetes .
+```
+
+Use RECOVERY_MODE=kubernetes and the existing mandatory start-ID wrapper. A core-only installation cannot perform Docker recovery. Switching to Docker requires installing requirements.txt or using the default image. The registry workflow continues publishing the default image; it does not publish a separate Kubernetes-only tag. This split avoids introducing a new Python package distribution solely for extras.

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.0 (unreleased)
+
+- Probe during startup and post-restart grace, allowing early readiness while retaining restart protection and the full recovery deadline.
+- Expose recovery context and persist terminal FAILED reasons with backward-compatible version 1 state loading.
+- Add validated LOG_TIMEZONE with UTC defaults and timezone data in core dependencies.
+- Diagnose Docker daemon and target access at startup without mutations or fatal handling of temporary outages.
+- Offer core-only dependencies and a Kubernetes image build option without the Docker SDK.
+- Document migration, early recovery semantics, failure codes and dependency choices in English and Korean.
+
 ## v0.1.1
 
 - Log effective non-sensitive settings, likely environment typos, safe startup errors, and restored recovery timing.

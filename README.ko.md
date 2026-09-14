@@ -89,7 +89,7 @@ docker compose up -d vllm-self-healer
 docker compose logs -f vllm-self-healer
 ```
 
-새 watchdog 시작 및 vLLM 재시작 이후에는 기본 300초의 startup grace를 적용합니다. 이후 두 probe가 모두 성공하면 정상 감시를 시작합니다. 기존에 저장된 복구 제한 시각과 FAILED 상태는 유지합니다.
+새 watchdog 시작 및 vLLM 재시작 이후에는 기본 300초의 startup grace를 적용합니다. 유예 중에도 검사하며 같은 회차에 두 probe가 모두 성공하면 즉시 정상 감시를 시작합니다. 조기 성공 이후에도 원래 유예 종료 시각까지 자동 재시작을 억제합니다. 기존에 저장된 복구 제한 시각과 FAILED 상태는 유지합니다.
 
 > Docker socket 접근은 호스트 Docker daemon을 제어할 수 있는 높은 권한입니다. 신뢰할 수 있는 코드와 이미지에만 부여하세요.
 
@@ -129,7 +129,7 @@ HTTP 연결 실패만으로는 기존 hang과 새 재시작을 구분할 수 없
 
 Backend는 /live=503을 노출하기 **전에** 이전 UUID와 제한 시각을 저장합니다. RESTARTING이나 RECOVERING 전환만으로 요청을 해제하지 않습니다. 다른 정상 UUID로 새 실행을 확인할 때까지 신호를 유지합니다. HTTP reader는 Controller의 다음 회차 전이라도 새 UUID를 확인하면 이전 신호를 즉시 차단하여 새 프로세스를 다시 재시작하지 않게 합니다.
 
-이후 Controller는 RECOVERING에서 STARTUP_GRACE_PERIOD를 기다리고 두 probe의 성공을 확인합니다. UUID 변경만으로 ready가 되지는 않습니다. Sidecar가 재기동되어도 대기 중 요청과 제한 시각을 상태 파일에서 복원합니다. Backend 정보가 없는 기존 version 1 Docker 상태 파일도 읽습니다.
+이후 Controller는 RECOVERING에서 STARTUP_GRACE_PERIOD 도중에도 즉시 검사하며 두 probe의 성공을 확인합니다. UUID 변경만으로 ready가 되지는 않습니다. Sidecar가 재기동되어도 대기 중 요청과 제한 시각을 상태 파일에서 복원합니다. Backend 정보가 없는 기존 version 1 Docker 상태 파일도 읽습니다.
 
 재시작 요청 시 UUID가 없거나 잘못되었거나, KUBERNETES_RESTART_TIMEOUT(기본 120초) 안에 새 UUID가 나타나지 않으면 FAILED로 전환합니다. 제한 시각이 지나면 제어 루프가 아직 실패를 처리하지 않았더라도 /live는 200으로 돌아가 오래된 신호를 차단하고 /ready는 503을 유지합니다. 이 제한은 liveness 주기 + termination grace + 예상 컨테이너 재시작 지연보다 길게 설정합니다.
 
@@ -180,10 +180,10 @@ RECOVERING → timeout → 재시도 정책 → 재시작 또는 FAILED
 | HEALTHY | 두 probe 성공 |
 | SUSPECT | Probe 실패 중이며, 임계치 도달 후 cooldown을 기다리는 경우도 포함 |
 | RESTARTING | 시도를 기록하고 복구 backend에 재시작 요청 |
-| RECOVERING | Startup grace 대기 또는 준비 상태 검증 |
+| RECOVERING | Startup grace 중에도 준비 상태 검증 |
 | FAILED | 자동 probe·재시작 중단, 운영자 조치 필요 |
 
-재시작 후 STARTUP_GRACE_PERIOD(300초)를 기다리고 RECOVERY_CHECK_INTERVAL(10초) 간격으로 복구를 검사합니다. RECOVERY_TIMEOUT(600초)은 **grace가 끝난 뒤부터** 계산합니다. 같은 회차에 두 probe가 모두 성공해야 복구입니다.
+최초 시작과 재시작 확인 후 즉시 복구 검사를 시작하고 RECOVERY_CHECK_INTERVAL(10초) 간격으로 반복합니다. STARTUP_GRACE_PERIOD(300초)는 검사가 아닌 자동 재시작을 억제합니다. 전체 복구 제한은 grace + RECOVERY_TIMEOUT(600초)을 유지하므로 계속 실패하면 기본 900초 후 재시작 정책을 평가합니다. 같은 회차에 두 probe가 모두 성공하고 POST_RECOVERY 정책도 통과해야 복구입니다.
 
 세 가지 제한을 적용합니다.
 
@@ -244,6 +244,7 @@ Docker daemon 장애와 결과가 불확실한 API timeout도 시도 횟수에 �
 | WATCHDOG_HTTP_PORT | 9090 | Kubernetes probe server 포트 |
 | VLLM_START_ID_FILE | /run/vllm-watchdog/start-id | 공유 vLLM 시작 UUID 파일 |
 | KUBERNETES_RESTART_TIMEOUT | 120 | 새 시작 UUID 최대 대기 시간 |
+| LOG_TIMEZONE | UTC | IANA 로그 시간대; 잘못된 값은 시작 오류 |
 | LOG_FILE | 빈 값 | 선택적 JSON 로그 파일, stdout 유지 |
 | LOG_MAX_BYTES | 10485760 | 양수인 로그 회전 크기 |
 | LOG_BACKUP_COUNT | 5 | 양수인 회전 백업 개수 |
@@ -271,6 +272,10 @@ VLLM_CONTAINER_NAME 필수 및 Docker timeout 관계 검증은 Docker 모드에�
 
 RECOVERY_TIMEOUT에는 startup grace가 포함되지 않습니다. MAX_RESTARTS는 rolling window와 미복구 연속 시도에 모두 적용합니다. Compose 전용 이미지·socket group 설정을 포함한 전체 예시는 [.env.example](.env.example)을 참고하세요.
 
+## v0.2.0 복구와 진단
+
+Grace 중에도 조기 준비 완료를 확인합니다. 로그와 event webhook에 recovery_reason을 표시하고, 최종 failed_reason은 재기동 후에도 유지합니다. LOG_TIMEZONE은 IANA 시간대를 지원하고 Docker 시작 진단은 읽기 전용이며 실패해도 감시를 계속합니다. 기본 이미지는 Docker 지원을 포함하며 Kubernetes용 core 전용 빌드도 가능합니다. [v0.2.0 전환 가이드](docs/operations.ko.md#v020-전환과-진단)를 참고하세요.
+
 ## v0.1.1 운영 기능
 
 시작 로그에 실제 비민감 설정, 의심되는 환경변수 오타, 안전한 시작 오류 유형·단계, 복원된 복구 시각을 추가했습니다. 파일 로그 회전과 HTTP 연동은 선택 사항이며 기존 사용자는 새 설정이 필요하지 않습니다.
@@ -280,7 +285,7 @@ RECOVERY_TIMEOUT에는 startup grace가 포함되지 않습니다. MAX_RESTARTS�
 - [Lifecycle action hook](docs/operations.ko.md#lifecycle-action-hook): 신뢰하는 외부 drain/ready service용 PRE_RESTART·POST_RECOVERY
 - [시간 설정과 상태 초기화](docs/operations.ko.md#시간-설정과-적용-시점): 설정 적용 시점과 watchdog 상태만 초기화하는 방법
 
-PRE abort는 재시작 없이 FAILED, POST abort는 readiness·RECOVERY_SUCCESS 없이 FAILED입니다. 두 정책의 기본값은 continue입니다. Legacy alert, UTC 시각, startup grace, 복구 제한과 두 backend 동작을 유지합니다.
+PRE abort는 재시작 없이 FAILED, POST abort는 readiness·RECOVERY_SUCCESS 없이 FAILED입니다. 두 정책의 기본값은 continue입니다. Legacy alert와 복구 예산은 호환됩니다. 로그 기본값은 UTC이며 webhook 시각은 LOG_TIMEZONE과 무관하게 UTC입니다.
 
 ## 로그와 알림
 

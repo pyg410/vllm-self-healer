@@ -89,7 +89,7 @@ docker compose up -d vllm-self-healer
 docker compose logs -f vllm-self-healer
 ```
 
-On a fresh watchdog startup and after a vLLM restart, the default startup grace is 300 seconds. Both probes must then succeed before normal monitoring begins. Previously saved recovery deadlines and FAILED state are preserved.
+On a fresh watchdog startup and after a vLLM restart, the default startup grace is 300 seconds. Probes run during grace; both must succeed in the same iteration before normal monitoring begins. Early success ends recovery immediately, but automatic restart remains suppressed until the original grace boundary. Previously saved recovery deadlines and FAILED state are preserved.
 
 > Docker socket access grants extensive control over the host Docker daemon. Give it only to trusted code and images.
 
@@ -129,7 +129,7 @@ HTTP unavailability alone cannot distinguish an existing hang from a new restart
 
 The backend records the old UUID and deadline **before** exposing /live=503. Entering RESTARTING or RECOVERING does not automatically clear the request. The signal remains until a different valid UUID proves a new launch. The HTTP reader immediately suppresses the old signal for that new UUID, even before the controller's next iteration, preventing it from restarting the new process again.
 
-The controller then enters RECOVERING, waits STARTUP_GRACE_PERIOD and requires both probes to succeed. A new UUID alone never marks the workload ready. Pending requests and their deadlines survive sidecar restarts through the state file. Legacy version 1 Docker state files without backend data are accepted.
+The controller then enters RECOVERING, probes immediately (including during STARTUP_GRACE_PERIOD) and requires both probes to succeed. A new UUID alone never marks the workload ready. Pending requests and their deadlines survive sidecar restarts through the state file. Legacy version 1 Docker state files without backend data are accepted.
 
 If the UUID is missing/invalid when requesting restart, or no new UUID appears within KUBERNETES_RESTART_TIMEOUT (default 120 seconds), the controller enters FAILED. At the deadline /live returns 200 even if the control loop has not yet processed the failure, stopping a stale signal; /ready remains 503. Set this timeout above the liveness period plus termination grace and expected container restart delay.
 
@@ -180,10 +180,10 @@ RECOVERING → timeout → retry policy → restart or FAILED
 | HEALTHY | Both probes succeeded |
 | SUSPECT | Probe failures; may also be waiting for cooldown after reaching the threshold |
 | RESTARTING | Attempt recorded; Recovery backend restart requested |
-| RECOVERING | Waiting for startup grace or verifying readiness |
+| RECOVERING | Verifying readiness, including during startup grace |
 | FAILED | Automatic probes/restarts stopped; operator action required |
 
-After a restart, the watchdog waits STARTUP_GRACE_PERIOD (300 seconds), then checks recovery at RECOVERY_CHECK_INTERVAL (10 seconds). RECOVERY_TIMEOUT (600 seconds) begins **after grace ends**. Recovery requires both probes to succeed in the same iteration.
+At startup and after a confirmed restart, recovery probes start immediately and repeat at RECOVERY_CHECK_INTERVAL (10 seconds). STARTUP_GRACE_PERIOD (300 seconds) suppresses automatic restart, not probing. The overall recovery deadline remains grace + RECOVERY_TIMEOUT (600 seconds), so persistent probe failure permits policy evaluation after 900 seconds by default. Both probes must succeed in the same iteration; POST_RECOVERY must also allow completion.
 
 Three safeguards apply:
 
@@ -244,6 +244,7 @@ All settings use environment variables. Durations are in seconds. Positive value
 | WATCHDOG_HTTP_PORT | 9090 | Kubernetes probe server port |
 | VLLM_START_ID_FILE | /run/vllm-watchdog/start-id | Shared vLLM launch UUID |
 | KUBERNETES_RESTART_TIMEOUT | 120 | Maximum wait for a new launch UUID |
+| LOG_TIMEZONE | UTC | IANA log timezone; invalid values fail startup |
 | LOG_FILE | Empty | Optional JSON log file; stdout stays enabled |
 | LOG_MAX_BYTES | 10485760 | Positive rotation size |
 | LOG_BACKUP_COUNT | 5 | Positive number of rotated backups |
@@ -271,6 +272,10 @@ VLLM_CONTAINER_NAME and the Docker timeout relationship are required only in Doc
 
 RECOVERY_TIMEOUT excludes startup grace. MAX_RESTARTS applies to both the rolling window and consecutive attempts without recovery. See [.env.example](.env.example) for the complete environment example, including Compose-only image and socket group settings.
 
+## v0.2.0 recovery and diagnostics
+
+Grace now allows early readiness. Recovery logs and event webhooks include recovery_reason; terminal failed_reason survives process restart. LOG_TIMEZONE supports IANA zones, and Docker startup diagnostics are read-only and non-fatal. The default image still includes Docker support; a core-only build is available for Kubernetes. See the [v0.2.0 migration guide](docs/operations.md#v020-migration-and-diagnostics).
+
 ## v0.1.1 operations
 
 Startup logs now show the effective non-sensitive configuration, likely environment-variable typos, safe startup error types/stages, and restored recovery timing. Optional rotating file logs and HTTP integrations require no settings for existing users.
@@ -280,7 +285,7 @@ Startup logs now show the effective non-sensitive configuration, likely environm
 - [Lifecycle action hooks](docs/operations.md#lifecycle-action-hooks): PRE_RESTART and POST_RECOVERY for trusted external drain/ready services.
 - [Timing and state reset](docs/operations.md#timing-and-when-configuration-applies): when settings take effect and how to reset only watchdog state.
 
-PRE abort enters FAILED without restarting; POST abort enters FAILED without marking readiness or emitting RECOVERY_SUCCESS. Both default to continue. Legacy alerts, UTC timestamps, startup grace, recovery limits and both backends remain supported.
+PRE abort enters FAILED without restarting; POST abort enters FAILED without marking readiness or emitting RECOVERY_SUCCESS. Both default to continue. Legacy alerts and recovery budgets remain compatible. Logs default to UTC; webhook timestamps remain UTC regardless of LOG_TIMEZONE.
 
 ## Logs and alerts
 
