@@ -2,8 +2,17 @@
 from .types import FailureReason
 
 
+class RecoveryFailure(Exception):
+    def __init__(self, failed_reason):
+        self.failed_reason = failed_reason
+        super().__init__(failed_reason.value)
+
+
 class RecoveryBackend:
     error_reason = FailureReason.RECOVERY_ERROR
+
+    def diagnose(self):
+        """Optional read-only startup check; never requests recovery."""
 
     def prepare(self):
         """Reserve backend state before the controller persists its attempt."""

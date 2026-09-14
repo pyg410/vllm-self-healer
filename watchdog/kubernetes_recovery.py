@@ -7,7 +7,8 @@ import time
 import uuid
 
 from .logging_config import log
-from .recovery import RecoveryBackend
+from .recovery import RecoveryBackend, RecoveryFailure
+from .types import FailedReason
 
 
 class KubernetesRecovery(RecoveryBackend):
@@ -29,7 +30,7 @@ class KubernetesRecovery(RecoveryBackend):
     def prepare(self):
         generation = self.generation()
         if generation is None:
-            raise RuntimeError("A valid vLLM start ID is required")
+            raise RecoveryFailure(FailedReason.INVALID_START_ID)
         with self.lock:
             self.armed = False
             self.request = {
@@ -63,7 +64,7 @@ class KubernetesRecovery(RecoveryBackend):
             log("vllm restart detected")
             return True
         if self.wall() >= request["deadline"]:
-            raise TimeoutError("Kubelet restart was not observed")
+            raise RecoveryFailure(FailedReason.RESTART_CONFIRMATION_TIMEOUT)
         return False
 
     def liveness_failed(self):

@@ -55,6 +55,9 @@ jobs:
           trap 'docker rm -f watchdog-smoke >/dev/null 2>&1 || true' EXIT
           docker run --detach --name watchdog-smoke \
             --env VLLM_MODEL=smoke-test \
+            --env VLLM_BASE_URL=http://127.0.0.1:1 \
+            --env HEALTH_TIMEOUT=1 \
+            --env INFERENCE_TIMEOUT=1 \
             --env STARTUP_GRACE_PERIOD=300 \
             vllm-self-healer:test
           ready=false
@@ -70,6 +73,14 @@ jobs:
           test "$ready" = true
           docker stop --time 10 watchdog-smoke
           test "$(docker inspect --format '{{.State.ExitCode}}' watchdog-smoke)" = 0
+
+      - name: Validate Kubernetes-only dependencies
+        run: |
+          docker build --build-arg REQUIREMENTS_FILE=requirements-core.txt -t vllm-self-healer:core-test .
+          docker run --rm vllm-self-healer:core-test python -c \
+            'import importlib.util; import watchdog.main; from zoneinfo import ZoneInfo; assert importlib.util.find_spec("docker") is None; ZoneInfo("Asia/Seoul")'
+          docker run --rm --volume "$PWD/tests:/app/tests:ro" \
+            vllm-self-healer:core-test python -m unittest discover -q
 
       - name: Log in to GHCR
         uses: docker/login-action@v3

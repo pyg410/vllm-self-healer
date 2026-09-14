@@ -3,7 +3,8 @@ import time
 from .logging_config import log, log_error
 from .hooks import NoopHooks
 from .state import RestartPolicy, StateError
-from .recovery import RecoveryBackend, ImmediateRecovery
+from .recovery import RecoveryBackend, ImmediateRecovery, RecoveryFailure
+from .types import FailedReason as F, RecoveryReason as C
 from .types import AlertEvent as E, FailureReason as R, WatchdogState as S
 
 
@@ -16,6 +17,8 @@ class Controller:
         self.clock, self.wall, self.stopping = clock, wall_clock, stopping
         self.hooks = hooks if hooks is not None else NoopHooks()
         self.events = events
+        self.recovery_reason = C.STARTUP
+        self.failed_reason = None
         self.state = S.RECOVERING
         self.health_failures = self.inference_failures = 0
         self.last_successful_inference = None
@@ -31,6 +34,9 @@ class Controller:
                 self.recovery_attempts = saved["recovery_attempts"]
                 self.last_successful_inference = saved["last_successful_inference"]
                 old_state = S(saved["state"])
+                self.recovery_reason = C.RESTORED_RECOVERY
+                if old_state == S.FAILED:
+                    self.failed_reason = F(saved.get("failed_reason") or F.UNKNOWN.value)
                 try:
                     self.recovery.restore(saved.get("backend", {}))
                 except (ValueError, TypeError, KeyError, AttributeError):
@@ -44,6 +50,8 @@ class Controller:
                     self.expires = self.clock() + max(0, saved["recovery_deadline"] - self.wall())
                 log("persisted state restored", state=old_state.value,
                     backend=config.recovery_mode, effective_state=self.state.value,
+                    recovery_reason=self.recovery_reason.value,
+                    failed_reason=self.failed_reason.value if self.failed_reason else None,
                     recovery_ready_at=saved["recovery_ready_at"],
                     recovery_deadline=saved["recovery_deadline"],
                     restart_history_count=len(self.policy.history),
@@ -60,20 +68,24 @@ class Controller:
         self.publish()
         log("watchdog started", state=self.state.value)
         if self.state == S.RECOVERING:
-            log("recovery started", state=self.state.value, initial=True)
+            log("recovery started", state=self.state.value, recovery_reason=self.recovery_reason.value, initial=True)
 
     def emit(self, event, reason):
         # Keep legacy ALERT_WEBHOOK_URL payloads and its original event set.
         if event != E.RESTART_CONFIRMED:
             self.alert.send(event, reason, len(self.policy.history))
         if self.events is not None:
-            self.events.send(event, reason, len(self.policy.history))
+            self.events.send(event, reason, len(self.policy.history),
+                             recovery_reason=self.recovery_reason.value,
+                             failed_reason=self.failed_reason.value if self.failed_reason else None)
 
     def persist(self):
         if self.persistence_broken:
             return
         self.store.save({
             "version": 1, "state": self.state.value,
+            "recovery_reason": self.recovery_reason.value,
+            "failed_reason": self.failed_reason.value if self.failed_reason else None,
             "backend": {} if self.state == S.SUSPECT else self.recovery.snapshot(),
             "restart_history": list(self.policy.history),
             "recovery_attempts": self.recovery_attempts,
@@ -89,13 +101,19 @@ class Controller:
     def transition(self, new):
         if self.state != new:
             old, self.state = self.state, new
-            log("state transition", previous=old.value, state=new.value)
+            log("state transition", previous=old.value, state=new.value,
+                recovery_reason=self.recovery_reason.value)
             self.publish()
 
-    def fail(self, reason, event):
+    def fail(self, reason, event, failed_reason=None):
+        self.failed_reason = failed_reason or {
+            R.RECOVERY_TIMEOUT: F.RECOVERY_TIMEOUT, R.HOOK_FAILURE: F.HOOK_FAILURE,
+            R.STATE_ERROR: F.STATE_ERROR, R.INTERNAL_ERROR: F.INTERNAL_ERROR,
+        }.get(reason, F.BACKEND_FAILURE)
         self.recovery.cancel()
         self.transition(S.FAILED)
-        log("automatic restart disabled", logging.ERROR, reason=reason.value, state=self.state.value)
+        log("automatic restart disabled", logging.ERROR, reason=reason.value,
+            failed_reason=self.failed_reason.value, state=self.state.value)
         try:
             self.persist()
         except StateError:
@@ -129,10 +147,13 @@ class Controller:
     def restart(self, reason):
         if self.stopping():
             return
+        # Early readiness does not remove the original grace protection.
+        if self.clock() < self.ready:
+            return
         now = self.wall()
         if self.policy.limit_reached(now, self.recovery_attempts):
             log("restart budget exceeded", logging.ERROR)
-            self.fail(reason, E.MAX_RESTART_EXCEEDED)
+            self.fail(reason, E.MAX_RESTART_EXCEEDED, F.RESTART_BUDGET_EXHAUSTED)
             return
         if self.policy.cooling_down(now):
             log("restart cooldown active", logging.DEBUG, state=self.state.value)
@@ -150,8 +171,9 @@ class Controller:
             self.persistence_broken = True
             self.fail(R.STATE_ERROR, E.RECOVERY_FAILED)
             return
-        except Exception:
-            self.fail(self.recovery.error_reason, E.RECOVERY_FAILED)
+        except Exception as error:
+            self.fail(self.recovery.error_reason, E.RECOVERY_FAILED,
+                      error.failed_reason if isinstance(error, RecoveryFailure) else F.BACKEND_FAILURE)
             return
         log("restart triggered", logging.WARNING, state=self.state.value, reason=reason.value,
             health_failure_count=self.health_failures, inference_failure_count=self.inference_failures,
@@ -172,8 +194,9 @@ class Controller:
             self.persist()
         except StateError:
             raise
-        except Exception:
-            self.fail(self.recovery.error_reason, E.RECOVERY_FAILED)
+        except Exception as error:
+            self.fail(self.recovery.error_reason, E.RECOVERY_FAILED,
+                      error.failed_reason if isinstance(error, RecoveryFailure) else F.BACKEND_FAILURE)
             return
         if self.stopping():
             return
@@ -194,10 +217,11 @@ class Controller:
         self.begin_recovery()
 
     def begin_recovery(self):
+        self.recovery_reason = C.POST_RESTART
         self.transition(S.RECOVERING)
         self.ready = self.clock() + self.c.startup_grace_period
         self.expires = self.ready + self.c.recovery_timeout
-        log("recovery started", state=self.state.value)
+        log("recovery started", state=self.state.value, recovery_reason=self.recovery_reason.value)
         self.persist()
 
     def step(self):
@@ -208,8 +232,9 @@ class Controller:
             if self.state == S.RESTARTING:
                 try:
                     completed = self.recovery.poll()
-                except Exception:
-                    self.fail(self.recovery.error_reason, E.RECOVERY_FAILED)
+                except Exception as error:
+                    self.fail(self.recovery.error_reason, E.RECOVERY_FAILED,
+                              error.failed_reason if isinstance(error, RecoveryFailure) else F.BACKEND_FAILURE)
                     return
                 if completed:
                     self.emit(E.RESTART_CONFIRMED, "backend_restart_completed")
@@ -233,8 +258,6 @@ class Controller:
             self.fail(R.INTERNAL_ERROR, E.RECOVERY_FAILED)
 
     def recover(self):
-        if self.clock() < self.ready:
-            return
         if self.clock() < self.expires:
             result = self.probes(recovery=True)
             if self.stopping():
@@ -246,10 +269,11 @@ class Controller:
                 if self.stopping():
                     return
                 self.transition(S.HEALTHY)
+                self.failed_reason = None
                 self.recovery_attempts = 0
                 self.health_failures = self.inference_failures = 0
                 self.persist()
-                log("recovery successful", state=self.state.value)
+                log("recovery successful", state=self.state.value, recovery_reason=self.recovery_reason.value)
                 self.emit(E.RECOVERY_SUCCESS, "probes_successful")
                 return
         if self.clock() >= self.expires:

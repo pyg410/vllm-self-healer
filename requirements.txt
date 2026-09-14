@@ -1,2 +1,2 @@
-requests>=2.32.3,<3
+-r requirements-core.txt
 docker>=7.1.0,<8

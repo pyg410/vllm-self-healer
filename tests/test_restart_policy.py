@@ -98,7 +98,8 @@ class ControllerTests(unittest.TestCase):
         self.health.reset_mock()
         controller = self.make()
         controller.step()
-        self.health.check.assert_not_called()
+        self.health.check.assert_called_once()
+        self.assertEqual(controller.state, S.HEALTHY)
         self.now += 300
         controller.step()
         self.assertEqual(controller.state, S.HEALTHY)

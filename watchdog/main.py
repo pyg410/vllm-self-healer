@@ -33,7 +33,7 @@ def main():
     server = None
     stage = "logging_setup"
     try:
-        configure(config.log_level, config.log_file, config.log_max_bytes, config.log_backup_count)
+        configure(config.log_level, config.log_file, config.log_max_bytes, config.log_backup_count, config.log_timezone)
         configuration_loaded(config.effective())
         stage = "http_client_setup"
         http = HttpClient()
@@ -42,6 +42,9 @@ def main():
         store.acquire()
         stage = "controller_initialization"
         recovery = create_recovery(config)
+        stage = "backend_diagnostics"
+        recovery.diagnose()
+        stage = "controller_initialization"
         status = ProbeStatus(recovery) if config.recovery_mode == "kubernetes" else None
         controller = Controller(config, HealthProbe(config, http), InferenceProbe(config, http),
                                 recovery, Alert(config, http), store, stopping=stop.is_set, status=status,

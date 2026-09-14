@@ -94,7 +94,7 @@ class EventWebhook:
         self.webhook = Webhook(config, client, "event_webhook")
         self.events = event_names(config.event_webhook_events)
 
-    def send(self, event, reason, restart_count):
+    def send(self, event, reason, restart_count, **context):
         if self.events and event.value not in self.events:
             return
-        self.webhook.send(metadata(self.config, event.value, reason, restart_count))
+        self.webhook.send({**metadata(self.config, event.value, reason, restart_count), **context})

@@ -6,7 +6,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from .types import WatchdogState
+from .types import WatchdogState, FailedReason, RecoveryReason
 
 
 class StateError(Exception):
@@ -39,6 +39,10 @@ class StateStore:
             if not isinstance(data, dict) or data.get("version") != 1:
                 raise ValueError()
             WatchdogState(data["state"])
+            if data.get("failed_reason") is not None:
+                FailedReason(data["failed_reason"])
+            if data.get("recovery_reason") is not None:
+                RecoveryReason(data["recovery_reason"])
             history = data["restart_history"]
             if not isinstance(history, list) or any(not self.timestamp(x) for x in history):
                 raise ValueError()

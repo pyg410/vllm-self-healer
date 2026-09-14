@@ -4,6 +4,7 @@ import logging
 import math
 import re
 import os
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import urlsplit
 from .logging_config import log
 from .webhooks import WEBHOOK_PREFIXES, METHODS, json_object, validate_headers, event_names
@@ -38,6 +39,7 @@ class Config:
     alert_timeout: float = 5
     state_file: str = "/data/watchdog_state.json"
     log_level: str = "INFO"
+    log_timezone: str = "UTC"
     log_file: str = ""
     log_max_bytes: int = 10485760
     log_backup_count: int = 5
@@ -115,6 +117,10 @@ class Config:
         for prefix in ("pre_restart_webhook", "post_recovery_webhook"):
             if getattr(self, prefix + "_failure_policy") not in {"continue", "abort"}:
                 raise ValueError(f"Invalid {prefix.upper()}_FAILURE_POLICY")
+        try:
+            ZoneInfo(self.log_timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError("Invalid LOG_TIMEZONE") from None
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("Invalid LOG_LEVEL")
 
@@ -124,7 +130,7 @@ class Config:
         # Paths, URLs, model/container names, prompts, headers and bodies stay out.
         result = {field.name: getattr(self, field.name) for field in fields(self)
                   if isinstance(getattr(self, field.name), (int, float))}
-        for name in ("recovery_mode", "log_level", "event_webhook_method",
+        for name in ("recovery_mode", "log_level", "log_timezone", "event_webhook_method",
                      "pre_restart_webhook_method", "post_recovery_webhook_method",
                      "pre_restart_webhook_failure_policy", "post_recovery_webhook_failure_policy"):
             result[name] = getattr(self, name)

@@ -2,22 +2,27 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
 class JsonFormatter(logging.Formatter):
+    def __init__(self, timezone_name="UTC"):
+        super().__init__()
+        self.timezone = ZoneInfo(timezone_name)
+
     def format(self, record):
         return json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(self.timezone).isoformat(),
             "level": record.levelname,
             "event": record.getMessage(),
             **getattr(record, "details", {}),
         }, ensure_ascii=False)
 
 
-def configure(level, log_file="", max_bytes=10485760, backup_count=5):
+def configure(level, log_file="", max_bytes=10485760, backup_count=5, timezone_name="UTC"):
     handlers = [logging.StreamHandler(sys.stdout)]
-    handlers[0].setFormatter(JsonFormatter())
+    handlers[0].setFormatter(JsonFormatter(timezone_name))
     logger = logging.getLogger("watchdog")
     for old in logger.handlers[:]:
         logger.removeHandler(old)
@@ -30,7 +35,7 @@ def configure(level, log_file="", max_bytes=10485760, backup_count=5):
     if log_file:
         handler = RotatingFileHandler(log_file, maxBytes=max_bytes,
                                       backupCount=backup_count, encoding="utf-8")
-        handler.setFormatter(JsonFormatter())
+        handler.setFormatter(JsonFormatter(timezone_name))
         logger.addHandler(handler)
 
 

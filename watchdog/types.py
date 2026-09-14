@@ -29,6 +29,24 @@ class FailureReason(str, Enum):
     HOOK_FAILURE = "hook_failure"
 
 
+class RecoveryReason(str, Enum):
+    STARTUP = "startup"
+    POST_RESTART = "post_restart"
+    RESTORED_RECOVERY = "restored_recovery"
+
+
+class FailedReason(str, Enum):
+    UNKNOWN = "unknown"
+    RECOVERY_TIMEOUT = "recovery_timeout"
+    RESTART_BUDGET_EXHAUSTED = "restart_budget_exhausted"
+    RESTART_CONFIRMATION_TIMEOUT = "restart_confirmation_timeout"
+    INVALID_START_ID = "invalid_start_id"
+    BACKEND_FAILURE = "backend_failure"
+    HOOK_FAILURE = "hook_failure"
+    STATE_ERROR = "state_error"
+    INTERNAL_ERROR = "internal_error"
+
+
 class AlertEvent(str, Enum):
     RESTART_TRIGGERED = "RESTART_TRIGGERED"
     RESTART_CONFIRMED = "RESTART_CONFIRMED"
