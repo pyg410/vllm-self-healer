@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.1 (unreleased)
+## v0.1.1
 
 - Log effective non-sensitive settings, likely environment typos, safe startup errors, and restored recovery timing.
 - Add optional rotating JSON file logs while retaining stdout.
