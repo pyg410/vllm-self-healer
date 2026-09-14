@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.0 (unreleased)
+## v0.2.0
 
 - Probe during startup and post-restart grace, allowing early readiness while retaining restart protection and the full recovery deadline.
 - Expose recovery context and persist terminal FAILED reasons with backward-compatible version 1 state loading.
