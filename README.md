@@ -21,7 +21,7 @@ A single failure does not trigger a restart. Recovery attempts are bounded, and 
 ## Features
 
 - **Real inference probes:** exercise the generation path with a small request.
-- **Automatic recovery:** restart the target Docker container after repeated failures.
+- **Automatic recovery:** recover the target container through Docker or Kubernetes after repeated failures.
 - **Recovery verification:** wait for model loading, then require both probes to succeed.
 - **Restart safeguards:** cooldown, rolling limits, and a cap on attempts without recovery.
 - **Persistent state:** retain restart history and FAILED across watchdog restarts.
@@ -199,7 +199,9 @@ Docker daemon failures and ambiguous API timeouts consume an attempt too. Becaus
 
 The loop is synchronous: each normal iteration takes health request time + inference request time + CHECK_INTERVAL. Requests do not overlap. Recovery probe deadlines are capped by the remaining recovery time.
 
-## Recovery scope and limitations
+## Detection scope and recovery limits
+
+A successful /health response does not establish successful inference. Synthetic generation can expose EngineCore stalls, silent generation hangs, CUDA/decode-path hangs or NCCL stalls when they affect the probe. **Detection does not guarantee container-level recovery.** GPU reset, node drain, host restart or operator intervention may still be necessary. The watchdog stops retrying at its configured budget and enters FAILED. See [known failure modes](docs/known-failure-modes.md).
 
 Recovery targets one vLLM container: directly through Docker or through kubelet liveness in Kubernetes. The watchdog does not diagnose or repair CUDA, NCCL, driver, or hardware bugs.
 
@@ -242,11 +244,43 @@ All settings use environment variables. Durations are in seconds. Positive value
 | WATCHDOG_HTTP_PORT | 9090 | Kubernetes probe server port |
 | VLLM_START_ID_FILE | /run/vllm-watchdog/start-id | Shared vLLM launch UUID |
 | KUBERNETES_RESTART_TIMEOUT | 120 | Maximum wait for a new launch UUID |
+| LOG_FILE | Empty | Optional JSON log file; stdout stays enabled |
+| LOG_MAX_BYTES | 10485760 | Positive rotation size |
+| LOG_BACKUP_COUNT | 5 | Positive number of rotated backups |
+| EVENT_WEBHOOK_URL | Empty | Informational event endpoint |
+| EVENT_WEBHOOK_METHOD | POST | POST, PUT or PATCH |
+| EVENT_WEBHOOK_TIMEOUT | 5 | Total request deadline |
+| EVENT_WEBHOOK_EVENTS | Empty | All events or comma-separated filter |
+| EVENT_WEBHOOK_HEADERS | {} | JSON object of string headers; never logged |
+| EVENT_WEBHOOK_BODY | {} | Static JSON object; never logged |
+| PRE_RESTART_WEBHOOK_URL | Empty | Optional action endpoint |
+| PRE_RESTART_WEBHOOK_METHOD | POST | POST, PUT, PATCH |
+| PRE_RESTART_WEBHOOK_TIMEOUT | 10 | Total deadline |
+| PRE_RESTART_WEBHOOK_HEADERS | {} | Secret JSON headers |
+| PRE_RESTART_WEBHOOK_BODY | {} | Static JSON body |
+| PRE_RESTART_WEBHOOK_FAILURE_POLICY | continue | continue or abort |
+| POST_RECOVERY_WEBHOOK_URL | Empty | Optional action endpoint |
+| POST_RECOVERY_WEBHOOK_METHOD | POST | POST, PUT, PATCH |
+| POST_RECOVERY_WEBHOOK_TIMEOUT | 10 | Total deadline |
+| POST_RECOVERY_WEBHOOK_HEADERS | {} | Secret JSON headers |
+| POST_RECOVERY_WEBHOOK_BODY | {} | Static JSON body |
+| POST_RECOVERY_WEBHOOK_FAILURE_POLICY | continue | continue or abort |
 
 VLLM_CONTAINER_NAME and the Docker timeout relationship are required only in Docker mode. RECOVERY_MODE defaults to docker; existing Compose deployments need no new settings.
 
 
 RECOVERY_TIMEOUT excludes startup grace. MAX_RESTARTS applies to both the rolling window and consecutive attempts without recovery. See [.env.example](.env.example) for the complete environment example, including Compose-only image and socket group settings.
+
+## v0.1.1 operations
+
+Startup logs now show the effective non-sensitive configuration, likely environment-variable typos, safe startup error types/stages, and restored recovery timing. Optional rotating file logs and HTTP integrations require no settings for existing users.
+
+- [Logging options and startup diagnostics](docs/operations.md#logging-choose-an-option): stdout plus a rotating application file, or stdout with Docker-managed rotation.
+- [Event webhooks](docs/operations.md#informational-event-webhook): optional filtered lifecycle notifications, including RESTART_CONFIRMED.
+- [Lifecycle action hooks](docs/operations.md#lifecycle-action-hooks): PRE_RESTART and POST_RECOVERY for trusted external drain/ready services.
+- [Timing and state reset](docs/operations.md#timing-and-when-configuration-applies): when settings take effect and how to reset only watchdog state.
+
+PRE abort enters FAILED without restarting; POST abort enters FAILED without marking readiness or emitting RECOVERY_SUCCESS. Both default to continue. Legacy alerts, UTC timestamps, startup grace, recovery limits and both backends remain supported.
 
 ## Logs and alerts
 
@@ -270,7 +304,7 @@ Example probe log, formatted for readability:
 
 The state field reflects the state at probe time; the subsequent state transition records healthy → suspect. Restart logs include both failure counters, reason, restart count, and the last successful inference timestamp.
 
-Set ALERT_WEBHOOK_URL to enable best-effort HTTP notifications. Events are RESTART_TRIGGERED, RECOVERY_SUCCESS, RECOVERY_FAILED, and MAX_RESTART_EXCEEDED. Initial readiness also emits RECOVERY_SUCCESS.
+Set ALERT_WEBHOOK_URL to enable best-effort HTTP notifications. Legacy alert events are RESTART_TRIGGERED, RECOVERY_SUCCESS, RECOVERY_FAILED, and MAX_RESTART_EXCEEDED; the new event webhook also supports RESTART_CONFIRMED. Initial readiness also emits RECOVERY_SUCCESS.
 
 Example webhook payload:
 
@@ -289,7 +323,9 @@ Webhook failures are logged and do not terminate the loop, though delivery may d
 
 ## Persistent state and FAILED recovery
 
-State is saved to /data/watchdog_state.json using atomic replacement and fsync. Restart attempts are persisted **before** the Docker API call. The file also retains recovery timing, the unrecovered attempt count, and last successful inference time.
+When an in-progress RECOVERING cycle is restored, stored recovery_ready_at/recovery_deadline override newly configured grace/timeout values until that cycle finishes or state is intentionally reset.
+
+State is saved to /data/watchdog_state.json using atomic replacement and fsync. Restart attempts are persisted **before** the recovery backend is activated. The file also retains recovery timing, the unrecovered attempt count, and last successful inference time.
 
 A file lock prevents concurrent watchdogs from using the same state path. Corrupt or unwritable state disables automatic restarts; corrupt files are preserved. FAILED remains latched after restarting the watchdog. Persistence errors can prevent FAILED itself from being saved.
 
@@ -303,7 +339,7 @@ To reset it intentionally:
 
 This resets the restart budget. Merely restarting the watchdog does not.
 
-SIGTERM/SIGINT interrupt waits and prevent new restart attempts. In-flight I/O finishes within its deadline, then state is saved and logging flushed. Set stop_grace_period above the longest Docker/probe deadline plus alert time; the example uses 90 seconds.
+SIGTERM/SIGINT interrupt waits and prevent new restart attempts. In-flight I/O finishes within its deadline, then state is saved and logging flushed. Set stop_grace_period above the longest backend/probe/hook deadline plus follow-on notification time; the example uses 90 seconds.
 
 ## Deployment and releases
 

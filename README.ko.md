@@ -21,7 +21,7 @@ vLLM Self-Healer는 Docker 또는 Kubernetes 환경에서 제한된 자동 복�
 ## 주요 기능
 
 - **실제 추론 검사:** 작은 요청으로 generation 경로의 응답 여부 확인
-- **자동 복구:** 반복 실패 시 대상 Docker 컨테이너 재시작
+- **자동 복구:** 반복 실패 시 Docker 또는 Kubernetes backend로 대상 컨테이너 복구
 - **복구 검증:** 모델 로딩을 기다린 뒤 두 probe의 성공 여부 확인
 - **재시작 제한:** cooldown, rolling limit, 복구 없는 연속 시도 제한
 - **상태 보존:** watchdog 재기동 후에도 재시작 이력과 FAILED 유지
@@ -199,7 +199,9 @@ Docker daemon 장애와 결과가 불확실한 API timeout도 시도 횟수에 �
 
 동기 루프이므로 일반 회차는 health 요청 시간 + inference 요청 시간 + CHECK_INTERVAL만큼 걸립니다. 요청은 겹치지 않습니다. 복구 probe의 deadline은 남은 복구 시간으로 제한합니다.
 
-## 복구 범위와 제한사항
+## 감지 범위와 복구 한계
+
+/health 성공이 추론 성공을 의미하지는 않습니다. Synthetic generation은 probe에 영향을 주는 EngineCore stall, silent generation hang, CUDA/decode 경로 hang, NCCL stall을 감지할 수 있습니다. **감지가 컨테이너 수준 복구를 보장하지는 않습니다.** GPU reset, node drain, 호스트 재시작, 운영자 개입이 필요할 수 있습니다. Watchdog은 예산에 도달하면 재시도를 멈추고 FAILED로 전환합니다. [알려진 장애 유형](docs/known-failure-modes.md)을 참고하세요.
 
 복구 대상은 vLLM 컨테이너 하나입니다. Docker에서는 직접 재시작하고 Kubernetes에서는 kubelet liveness를 사용합니다. CUDA·NCCL·드라이버·하드웨어 버그의 원인을 진단하거나 수리하지 않습니다.
 
@@ -242,11 +244,43 @@ Docker daemon 장애와 결과가 불확실한 API timeout도 시도 횟수에 �
 | WATCHDOG_HTTP_PORT | 9090 | Kubernetes probe server 포트 |
 | VLLM_START_ID_FILE | /run/vllm-watchdog/start-id | 공유 vLLM 시작 UUID 파일 |
 | KUBERNETES_RESTART_TIMEOUT | 120 | 새 시작 UUID 최대 대기 시간 |
+| LOG_FILE | 빈 값 | 선택적 JSON 로그 파일, stdout 유지 |
+| LOG_MAX_BYTES | 10485760 | 양수인 로그 회전 크기 |
+| LOG_BACKUP_COUNT | 5 | 양수인 회전 백업 개수 |
+| EVENT_WEBHOOK_URL | 빈 값 | 정보 전달 이벤트 endpoint |
+| EVENT_WEBHOOK_METHOD | POST | POST, PUT, PATCH |
+| EVENT_WEBHOOK_TIMEOUT | 5 | 전체 요청 deadline |
+| EVENT_WEBHOOK_EVENTS | 빈 값 | 전체 또는 쉼표로 구분한 필터 |
+| EVENT_WEBHOOK_HEADERS | {} | 문자열 header JSON object, 로그 제외 |
+| EVENT_WEBHOOK_BODY | {} | Static JSON object, 로그 제외 |
+| PRE_RESTART_WEBHOOK_URL | 빈 값 | 선택적 action endpoint |
+| PRE_RESTART_WEBHOOK_METHOD | POST | POST, PUT, PATCH |
+| PRE_RESTART_WEBHOOK_TIMEOUT | 10 | 전체 deadline |
+| PRE_RESTART_WEBHOOK_HEADERS | {} | 로그에 남기지 않는 JSON header |
+| PRE_RESTART_WEBHOOK_BODY | {} | Static JSON body |
+| PRE_RESTART_WEBHOOK_FAILURE_POLICY | continue | continue 또는 abort |
+| POST_RECOVERY_WEBHOOK_URL | 빈 값 | 선택적 action endpoint |
+| POST_RECOVERY_WEBHOOK_METHOD | POST | POST, PUT, PATCH |
+| POST_RECOVERY_WEBHOOK_TIMEOUT | 10 | 전체 deadline |
+| POST_RECOVERY_WEBHOOK_HEADERS | {} | 로그에 남기지 않는 JSON header |
+| POST_RECOVERY_WEBHOOK_BODY | {} | Static JSON body |
+| POST_RECOVERY_WEBHOOK_FAILURE_POLICY | continue | continue 또는 abort |
 
 VLLM_CONTAINER_NAME 필수 및 Docker timeout 관계 검증은 Docker 모드에만 적용합니다. RECOVERY_MODE 기본값은 docker이며 기존 Compose에는 새 설정이 필요하지 않습니다.
 
 
 RECOVERY_TIMEOUT에는 startup grace가 포함되지 않습니다. MAX_RESTARTS는 rolling window와 미복구 연속 시도에 모두 적용합니다. Compose 전용 이미지·socket group 설정을 포함한 전체 예시는 [.env.example](.env.example)을 참고하세요.
+
+## v0.1.1 운영 기능
+
+시작 로그에 실제 비민감 설정, 의심되는 환경변수 오타, 안전한 시작 오류 유형·단계, 복원된 복구 시각을 추가했습니다. 파일 로그 회전과 HTTP 연동은 선택 사항이며 기존 사용자는 새 설정이 필요하지 않습니다.
+
+- [로그와 시작 진단](docs/operations.ko.md#로그-두-방식-중-선택): stdout + 애플리케이션 파일 회전 또는 stdout + Docker 로그 회전
+- [Event webhook](docs/operations.ko.md#정보-전달용-event-webhook): RESTART_CONFIRMED를 포함한 선택적 이벤트 알림·필터
+- [Lifecycle action hook](docs/operations.ko.md#lifecycle-action-hook): 신뢰하는 외부 drain/ready service용 PRE_RESTART·POST_RECOVERY
+- [시간 설정과 상태 초기화](docs/operations.ko.md#시간-설정과-적용-시점): 설정 적용 시점과 watchdog 상태만 초기화하는 방법
+
+PRE abort는 재시작 없이 FAILED, POST abort는 readiness·RECOVERY_SUCCESS 없이 FAILED입니다. 두 정책의 기본값은 continue입니다. Legacy alert, UTC 시각, startup grace, 복구 제한과 두 backend 동작을 유지합니다.
 
 ## 로그와 알림
 
@@ -270,7 +304,7 @@ stdout에 JSON 로그를 출력합니다. 성공 probe는 DEBUG, 실패는 WARNI
 
 state는 검사 시점의 상태입니다. 뒤따르는 상태 전환 로그에 healthy → suspect가 기록됩니다. 재시작 로그에는 두 실패 카운터, reason, 재시작 횟수, 마지막 추론 성공 시각이 포함됩니다.
 
-ALERT_WEBHOOK_URL을 설정하면 best-effort HTTP 알림을 사용합니다. 이벤트는 RESTART_TRIGGERED, RECOVERY_SUCCESS, RECOVERY_FAILED, MAX_RESTART_EXCEEDED입니다. 최초 준비 완료도 RECOVERY_SUCCESS를 보냅니다.
+ALERT_WEBHOOK_URL을 설정하면 best-effort HTTP 알림을 사용합니다. Legacy alert는 RESTART_TRIGGERED, RECOVERY_SUCCESS, RECOVERY_FAILED, MAX_RESTART_EXCEEDED이며 새 event webhook은 RESTART_CONFIRMED도 지원합니다. 최초 준비 완료도 RECOVERY_SUCCESS를 보냅니다.
 
 Webhook payload 예시:
 
@@ -289,7 +323,9 @@ Webhook 실패는 로그만 남기고 루프를 종료하지 않지만 최대 AL
 
 ## 상태 저장과 FAILED 대응
 
-/data/watchdog_state.json에 atomic replacement와 fsync로 저장합니다. 재시작 시도는 **Docker API 호출 전에** 기록합니다. 복구 시각, 미복구 연속 시도 횟수, 마지막 추론 성공 시각도 저장합니다.
+진행 중 RECOVERING을 복원하면 저장된 recovery_ready_at/recovery_deadline이 새 grace/timeout 환경변수보다 우선합니다. 해당 회차 종료 또는 의도적인 상태 초기화 이후 새 값이 적용됩니다.
+
+/data/watchdog_state.json에 atomic replacement와 fsync로 저장합니다. 재시작 시도는 **복구 backend 활성화 전에** 기록합니다. 복구 시각, 미복구 연속 시도 횟수, 마지막 추론 성공 시각도 저장합니다.
 
 파일 lock은 같은 상태 경로를 사용하는 동시 실행을 막습니다. 손상되거나 쓸 수 없는 상태 파일은 자동 재시작을 차단하며 손상 파일은 보존합니다. FAILED는 watchdog을 재시작해도 유지됩니다. 저장 오류가 있으면 FAILED 자체를 저장하지 못할 수도 있습니다.
 
@@ -303,7 +339,7 @@ Webhook 실패는 로그만 남기고 루프를 종료하지 않지만 최대 AL
 
 이 작업은 재시작 예산도 초기화합니다. 단순한 watchdog 재시작으로는 초기화되지 않습니다.
 
-SIGTERM/SIGINT는 대기를 깨우고 새 재시작을 막습니다. 진행 중 I/O는 deadline 안에 마무리한 뒤 상태 저장과 로그 flush를 수행합니다. stop_grace_period는 가장 긴 Docker/probe deadline과 alert 시간을 합친 값보다 넉넉하게 설정합니다. 예시는 90초입니다.
+SIGTERM/SIGINT는 대기를 깨우고 새 재시작을 막습니다. 진행 중 I/O는 deadline 안에 마무리한 뒤 상태 저장과 로그 flush를 수행합니다. stop_grace_period는 가장 긴 backend/probe/hook deadline과 후속 알림 시간을 합친 값보다 넉넉하게 설정합니다. 예시는 90초입니다.
 
 ## 배포와 릴리스
 

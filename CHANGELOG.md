@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.1 (unreleased)
+
+- Log effective non-sensitive settings, likely environment typos, safe startup errors, and restored recovery timing.
+- Add optional rotating JSON file logs while retaining stdout.
+- Add filtered informational event webhooks and restart-confirmed events without changing legacy alerts.
+- Add generic PRE_RESTART and POST_RECOVERY HTTP hooks with explicit continue/abort semantics.
+- Preserve Kubernetes start-ID safety across slow or interrupted PRE hooks.
+- Document logging alternatives, timing/state reset, trusted integrations and detection/recovery limits.
+- Keep grace behavior, UTC timestamps, restart budgets, and version 1 state compatibility unchanged.
+
 ## v0.1.0
 
 - Add Kubernetes sidecar recovery using kubelet liveness and readiness probes.
